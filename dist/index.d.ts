@@ -1,3 +1,5 @@
+import { Plugin } from '@opencode/plugin';
+
 /** Clock abstraction to keep business logic mockable. */
 interface Clock {
     nowMs(): number;
@@ -44,7 +46,7 @@ declare function getAvailableHooks(host: unknown): string[];
  */
 declare function handleGoalCommand(rawInput: string, projectDir: string, clock?: Clock, hostVersion?: string): Promise<string>;
 /**
- * Phase 1 stub kept for compatibility.
+ * Legacy probe stub kept for compatibility with earlier tests.
  */
 declare function handleIdleStub(): string;
 /** Options for idle registration. */
@@ -73,16 +75,6 @@ declare function registerIdleHandler(host: unknown, opts: RegisterIdleOptions): 
     registered: boolean;
     reason: string;
 };
-declare const plugin: {
-    name: string;
-    version: string;
-    getAvailableHooks: typeof getAvailableHooks;
-    handleGoalCommand: typeof handleGoalCommand;
-    handleIdleStub: typeof handleIdleStub;
-    registerIdleHandler: typeof registerIdleHandler;
-    defaultHasStopFile: typeof defaultHasStopFile;
-    registerCompactionHandler: typeof registerCompactionHandler;
-};
 /** Options for compaction registration. */
 interface RegisterCompactionOptions {
     projectDir: string;
@@ -99,5 +91,24 @@ declare function registerCompactionHandler(host: unknown, opts: RegisterCompacti
     registered: boolean;
     reason: string;
 };
+/**
+ * Build the work instruction posted when a goal is set through the V2 command.
+ * The instruction carries the objective plus the stop verbs so the agent loop
+ * knows how to report done, stuck, or cancelled.
+ * @param objective active objective text
+ * @param iterationCount current turn count for context
+ */
+declare function buildGoalWorkInstruction(objective: string, iterationCount: number): string;
+/**
+ * Resolve the project directory for file state from a V2 context.
+ * Falls back to the process working directory when the host gives none.
+ * @param ctx unknown V2 plugin context
+ */
+declare function resolveProjectDir(ctx: unknown): string;
+/**
+ * OpenCode V2 plugin definition. The host loader validates this exact shape:
+ * a default export with an id plus a setup function.
+ */
+declare const _default: Plugin.Plugin;
 
-export { type MinimalHost, PLUGIN_NAME, PLUGIN_VERSION, type RegisterCompactionOptions, type RegisterIdleOptions, plugin as default, defaultHasStopFile, getAvailableHooks, handleGoalCommand, handleIdleStub, registerCompactionHandler, registerIdleHandler };
+export { type MinimalHost, PLUGIN_NAME, PLUGIN_VERSION, type RegisterCompactionOptions, type RegisterIdleOptions, buildGoalWorkInstruction, _default as default, defaultHasStopFile, getAvailableHooks, handleGoalCommand, handleIdleStub, registerCompactionHandler, registerIdleHandler, resolveProjectDir };

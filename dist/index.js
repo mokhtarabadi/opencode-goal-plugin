@@ -1,6 +1,7 @@
 // src/index.ts
-import * as path2 from "path";
-import { promises as fs2 } from "fs";
+import * as path3 from "path";
+import { promises as fs3 } from "fs";
+import { Plugin } from "@opencode/plugin";
 
 // src/state.ts
 import { promises as fs } from "fs";
@@ -476,6 +477,28 @@ async function restoreAfterCompaction(statePath, clock, store) {
   };
 }
 
+// src/evidence.ts
+import { promises as fs2 } from "fs";
+import path2 from "path";
+import { createHash } from "crypto";
+var EVIDENCE_VERSION = 1;
+var EVIDENCE_FILE_NAME = "goal-evidence.json";
+var evidenceTmpCounter = 0;
+function resolveEvidencePath(projectDir) {
+  return path2.join(projectDir, ".opencode", EVIDENCE_FILE_NAME);
+}
+function emptyEvidence(nowMs) {
+  return { version: EVIDENCE_VERSION, updatedAtMs: nowMs, criteria: [] };
+}
+async function saveEvidence(projectDir, ev) {
+  const target = resolveEvidencePath(projectDir);
+  await fs2.mkdir(path2.dirname(target), { recursive: true });
+  evidenceTmpCounter += 1;
+  const tmp = target + ".tmp-" + String(process.pid) + "-" + String(evidenceTmpCounter);
+  await fs2.writeFile(tmp, JSON.stringify(ev, null, 2), "utf8");
+  await fs2.rename(tmp, target);
+}
+
 // src/index.ts
 var PLUGIN_NAME = "opencode-goal-plugin";
 var PLUGIN_VERSION = "0.2.0";
@@ -569,7 +592,7 @@ function handleIdleStub() {
 function defaultHasStopFile(projectDir) {
   return async () => {
     try {
-      await fs2.access(path2.join(projectDir, ".opencode", STOP_FILE_NAME));
+      await fs3.access(path3.join(projectDir, ".opencode", STOP_FILE_NAME));
       return true;
     } catch (e) {
       const code = e.code;
@@ -611,16 +634,7 @@ function registerIdleHandler(host, opts) {
       lastId = null;
     }
     const ctx = { projectDir: opts.projectDir, lastMessageId: lastId };
-    const deps = {
-      clock,
-      limits,
-      ownerId,
-      loadState: loadGoalState,
-      saveState: saveGoalState,
-      tryClaim: tryClaimLease,
-      sendPrompt: opts.sendPrompt,
-      hasStopFile
-    };
+    const deps = { clock, limits, ownerId, loadState: loadGoalState, saveState: saveGoalState, tryClaim: tryClaimLease, sendPrompt: opts.sendPrompt, hasStopFile };
     try {
       await handleSessionIdle(ctx, deps);
     } catch {
@@ -633,16 +647,6 @@ function registerIdleHandler(host, opts) {
     return { registered: false, reason: "register-failed" };
   }
 }
-var plugin = {
-  name: PLUGIN_NAME,
-  version: PLUGIN_VERSION,
-  getAvailableHooks,
-  handleGoalCommand,
-  handleIdleStub,
-  registerIdleHandler,
-  defaultHasStopFile,
-  registerCompactionHandler
-};
 function registerCompactionHandler(host, opts) {
   try {
     if (opts === null || typeof opts !== "object") {
@@ -685,15 +689,161 @@ function registerCompactionHandler(host, opts) {
     return { registered: false, reason: "register-failed" };
   }
 }
-var index_default = plugin;
+function buildGoalWorkInstruction(objective, iterationCount) {
+  return 'Goal accepted: "' + objective + '" (turn ' + String(iterationCount + 1) + ").\nWork toward it now with concrete steps.\nWhen done, finish with evidence and call /goal complete. If blocked, call /goal block <reason>. To cancel, call /goal clear.";
+}
+function resolveProjectDir(ctx) {
+  try {
+    const c = ctx;
+    if (typeof c.location?.directory === "string" && c.location.directory.length > 0) {
+      return c.location.directory;
+    }
+  } catch {
+  }
+  return process.cwd();
+}
+async function notifySynthetic(session, sessionID, text) {
+  try {
+    if (typeof session.synthetic === "function") {
+      await session.synthetic({ sessionID, text });
+    }
+  } catch {
+  }
+}
+var index_default = Plugin.define({
+  id: PLUGIN_NAME,
+  async setup(ctx) {
+    const projectDir = resolveProjectDir(ctx);
+    const clock = new SystemClock();
+    const ownerId = "v2-" + String(process.pid) + "-" + String(Math.floor(Math.random() * 1e6));
+    const hasStopFile = defaultHasStopFile(projectDir);
+    try {
+      const cmd = ctx.command;
+      if (cmd !== null && typeof cmd === "object" && typeof cmd.transform === "function") {
+        await cmd.transform((editor) => {
+          editor.add({
+            name: "goal",
+            description: "Set a session goal and auto-continue until complete, blocked, or cleared.",
+            execute: async (invocation) => {
+              try {
+                const inv = invocation;
+                const sessionID = typeof inv.sessionID === "string" ? inv.sessionID : "";
+                const text = typeof inv.prompt?.text === "string" ? inv.prompt.text : "";
+                const parsed = parseGoalCommand("/goal " + text);
+                if (parsed.kind === "set") {
+                  const statePath = resolveStatePath(projectDir);
+                  const current = await loadGoalState(statePath).catch(() => null);
+                  const next = setObjective(current, parsed.objective, clock, "2.0.29");
+                  await saveGoalState(statePath, next);
+                  await saveEvidence(projectDir, emptyEvidence(clock.nowMs())).catch(() => void 0);
+                  if (sessionID !== "") {
+                    await ctx.session?.prompt?.({ sessionID, text: buildGoalWorkInstruction(next.objective, next.iterationCount) }).catch(() => void 0);
+                  }
+                  return;
+                }
+                const message = await handleGoalCommand("/goal " + text, projectDir, clock);
+                if (sessionID !== "") {
+                  const session = ctx.session;
+                  if (session !== void 0) await notifySynthetic(session, sessionID, message);
+                }
+              } catch {
+              }
+            }
+          });
+        });
+      }
+    } catch {
+    }
+    const controller = new AbortController();
+    const idleTask = (async () => {
+      try {
+        const events = ctx.event;
+        if (events === void 0 || typeof events.subscribe !== "function") return;
+        const stream = events.subscribe({ signal: controller.signal });
+        for await (const event of stream) {
+          try {
+            if (event === null || typeof event !== "object") continue;
+            if (event.type !== "session.idle") continue;
+            const data = event.data;
+            const props = event.properties;
+            const rawID = data?.sessionID ?? props?.sessionID;
+            if (typeof rawID !== "string" || rawID.length === 0) continue;
+            const session = ctx.session;
+            if (session === void 0 || typeof session.prompt !== "function") continue;
+            const promptFn = session.prompt.bind(session);
+            const deps = {
+              clock,
+              limits: DEFAULT_LIMITS,
+              ownerId,
+              loadState: loadGoalState,
+              saveState: saveGoalState,
+              tryClaim: tryClaimLease,
+              sendPrompt: async (prompt) => {
+                const res = await promptFn({ sessionID: rawID, text: prompt }).catch(() => null);
+                const messageID = typeof res?.messageID === "string" && res.messageID.length > 0 ? res.messageID : "turn-unlabeled";
+                const tokenSpend = typeof res?.tokenSpend === "number" ? res.tokenSpend : 0;
+                return { messageId: messageID, tokenSpend };
+              },
+              hasStopFile
+            };
+            await handleSessionIdle({ projectDir, lastMessageId: null }, deps);
+          } catch {
+          }
+        }
+      } catch {
+      }
+    })();
+    try {
+      const session = ctx.session;
+      if (session !== void 0 && typeof session.hook === "function") {
+        await session.hook("compaction", (event) => {
+          try {
+            const e = event;
+            if (typeof e.sessionID !== "string") return;
+            void loadGoalState(resolveStatePath(projectDir)).then((state) => {
+              if (state === null || state.status !== "active") return;
+              if (!Array.isArray(e.messages)) return;
+              e.messages.push({
+                role: "user",
+                content: 'Restored goal after compaction: "' + state.objective + '" (turn ' + String(state.iterationCount) + "). Continue it."
+              });
+            }).catch(() => void 0);
+          } catch {
+          }
+        }).catch(() => void 0);
+        await session.hook("context", (event) => {
+          try {
+            const e = event;
+            void loadGoalState(resolveStatePath(projectDir)).then((state) => {
+              if (state === null || state.status !== "active") return;
+              if (!Array.isArray(e.system)) return;
+              e.system.push({ type: "text", text: 'Active goal: "' + state.objective + '". Finish with evidence, or report blocked.' });
+            }).catch(() => void 0);
+          } catch {
+          }
+        }).catch(() => void 0);
+      }
+    } catch {
+    }
+    return () => {
+      try {
+        controller.abort();
+      } catch {
+      }
+      void idleTask.catch(() => void 0);
+    };
+  }
+});
 export {
   PLUGIN_NAME,
   PLUGIN_VERSION,
+  buildGoalWorkInstruction,
   index_default as default,
   defaultHasStopFile,
   getAvailableHooks,
   handleGoalCommand,
   handleIdleStub,
   registerCompactionHandler,
-  registerIdleHandler
+  registerIdleHandler,
+  resolveProjectDir
 };

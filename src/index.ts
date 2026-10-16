@@ -1,29 +1,20 @@
 /**
- * Plugin entry Phase 2.
- * Why this file exists: single public surface for ESM plus CJS hosts.
- * Slash goal keeps Phase 1 guarded behavior, idle auto-continue is the new opt-in wiring.
+ * Plugin entry: OpenCode V2 host binding.
+ * Why this file exists: the host loader requires a default export shaped as
+ * Plugin.define with an id plus a setup function. All slash, state, loop,
+ * and guard logic lives in the pure modules below so tests never need a host.
  */
 import * as path from 'node:path';
 import { promises as fs } from 'node:fs';
-import {
-  SystemClock,
-  loadGoalState,
-  resolveStatePath,
-  saveGoalState,
-  tryClaimLease,
-} from './state.js';
+import { Plugin } from '@opencode/plugin';
+import { SystemClock, loadGoalState, resolveStatePath, saveGoalState, tryClaimLease } from './state.js';
 import type { Clock, GoalState } from './state.js';
-import {
-  blockGoal,
-  clearGoal,
-  completeGoal,
-  parseGoalCommand,
-  setObjective,
-} from './goal.js';
+import { blockGoal, clearGoal, completeGoal, parseGoalCommand, setObjective } from './goal.js';
 import { handleSessionIdle } from './loop.js';
-import { snapshotForCompaction, restoreAfterCompaction } from './compaction.js';
 import { DEFAULT_LIMITS, STOP_FILE_NAME } from './limits.js';
 import type { Limits } from './limits.js';
+import { snapshotForCompaction, restoreAfterCompaction } from './compaction.js';
+import { saveEvidence, emptyEvidence } from './evidence.js';
 
 export const PLUGIN_NAME = 'opencode-goal-plugin';
 export const PLUGIN_VERSION = '0.2.0';
@@ -69,7 +60,7 @@ export async function handleGoalCommand(
   rawInput: string,
   projectDir: string,
   clock: Clock = new SystemClock(),
-  hostVersion: string = '2.0.29',
+  hostVersion: string = '2.0.29'
 ): Promise<string> {
   // Type guards first: a misbehaving host gets a message, never a TypeError.
   if (typeof rawInput !== 'string') {
@@ -89,11 +80,7 @@ export async function handleGoalCommand(
     current = await loadGoalState(statePath);
   } catch {
     // Corrupt JSON or shape mismatch: point at the file, do not throw.
-    return (
-      'Goal state is corrupt at ' +
-      statePath +
-      '. Back up the file then clear it.'
-    );
+    return 'Goal state is corrupt at ' + statePath + '. Back up the file then clear it.';
   }
   if (parsed.kind === 'status') {
     if (current === null) return 'No goal set. Use /goal <objective>.';
@@ -118,11 +105,7 @@ export async function handleGoalCommand(
     try {
       next = blockGoal(current, parsed.reason, clock);
     } catch {
-      return (
-        'Only an active goal can be blocked. Current status: ' +
-        current.status +
-        '.'
-      );
+      return 'Only an active goal can be blocked. Current status: ' + current.status + '.';
     }
     try {
       await saveGoalState(statePath, next);
@@ -136,11 +119,7 @@ export async function handleGoalCommand(
     try {
       next = completeGoal(current, clock);
     } catch {
-      return (
-        'Only an active goal can complete. Current status: ' +
-        current.status +
-        '.'
-      );
+      return 'Only an active goal can complete. Current status: ' + current.status + '.';
     }
     try {
       await saveGoalState(statePath, next);
@@ -159,7 +138,7 @@ export async function handleGoalCommand(
 }
 
 /**
- * Phase 1 stub kept for compatibility.
+ * Legacy probe stub kept for compatibility with earlier tests.
  */
 export function handleIdleStub(): string {
   return 'phase2-not-implemented';
@@ -169,9 +148,7 @@ export function handleIdleStub(): string {
 export interface RegisterIdleOptions {
   projectDir: string;
   getLastMessageId: () => string | null;
-  sendPrompt: (
-    prompt: string,
-  ) => Promise<{ messageId: string; tokenSpend?: number }>;
+  sendPrompt: (prompt: string) => Promise<{ messageId: string; tokenSpend?: number }>;
   clock?: Clock;
   limits?: Limits;
   ownerId?: string;
@@ -187,8 +164,7 @@ export function defaultHasStopFile(projectDir: string): () => Promise<boolean> {
       await fs.access(path.join(projectDir, '.opencode', STOP_FILE_NAME));
       return true;
     } catch (e: unknown) {
-      // ENOENT means no kill switch. Any other error fails closed: the
-      // idle handler maps the throw to stop-check-failed instead of ignoring STOP_GOAL.
+      // ENOENT means no kill switch. Other errors fail closed upstream.
       const code = (e as { code?: string }).code;
       if (code === 'ENOENT') return false;
       throw e;
@@ -201,24 +177,15 @@ export function defaultHasStopFile(projectDir: string): () => Promise<boolean> {
  * @param host unknown host object from OpenCode V2
  * @param opts project dir plus host callbacks
  */
-export function registerIdleHandler(
-  host: unknown,
-  opts: RegisterIdleOptions,
-): { registered: boolean; reason: string } {
+export function registerIdleHandler(host: unknown, opts: RegisterIdleOptions): { registered: boolean; reason: string } {
   // Opts guards first: bad input gets a reason string, never a TypeError.
   if (opts === null || typeof opts !== 'object') {
     return { registered: false, reason: 'invalid-opts' };
   }
-  if (
-    typeof opts.projectDir !== 'string' ||
-    opts.projectDir.trim().length === 0
-  ) {
+  if (typeof opts.projectDir !== 'string' || opts.projectDir.trim().length === 0) {
     return { registered: false, reason: 'invalid-opts' };
   }
-  if (
-    typeof opts.getLastMessageId !== 'function' ||
-    typeof opts.sendPrompt !== 'function'
-  ) {
+  if (typeof opts.getLastMessageId !== 'function' || typeof opts.sendPrompt !== 'function') {
     return { registered: false, reason: 'invalid-opts' };
   }
   // Probe first so unknown hosts get a reason string, never an exception.
@@ -233,12 +200,7 @@ export function registerIdleHandler(
   const clock = opts.clock ?? new SystemClock();
   const limits = opts.limits ?? DEFAULT_LIMITS;
   // Random owner suffix separates this process from other loop runners.
-  const ownerId =
-    opts.ownerId ??
-    'idle-' +
-      String(process.pid) +
-      '-' +
-      String(Math.floor(Math.random() * 1000000));
+  const ownerId = opts.ownerId ?? ('idle-' + String(process.pid) + '-' + String(Math.floor(Math.random() * 1000000)));
   if (typeof ownerId !== 'string' || ownerId.length === 0) {
     return { registered: false, reason: 'invalid-opts' };
   }
@@ -252,16 +214,7 @@ export function registerIdleHandler(
       lastId = null;
     }
     const ctx = { projectDir: opts.projectDir, lastMessageId: lastId };
-    const deps = {
-      clock,
-      limits,
-      ownerId,
-      loadState: loadGoalState,
-      saveState: saveGoalState,
-      tryClaim: tryClaimLease,
-      sendPrompt: opts.sendPrompt,
-      hasStopFile,
-    };
+    const deps = { clock, limits, ownerId, loadState: loadGoalState, saveState: saveGoalState, tryClaim: tryClaimLease, sendPrompt: opts.sendPrompt, hasStopFile };
     try {
       await handleSessionIdle(ctx, deps);
     } catch {
@@ -275,17 +228,6 @@ export function registerIdleHandler(
     return { registered: false, reason: 'register-failed' };
   }
 }
-
-const plugin = {
-  name: PLUGIN_NAME,
-  version: PLUGIN_VERSION,
-  getAvailableHooks,
-  handleGoalCommand,
-  handleIdleStub,
-  registerIdleHandler,
-  defaultHasStopFile,
-  registerCompactionHandler,
-};
 
 /** Options for compaction registration. */
 export interface RegisterCompactionOptions {
@@ -302,18 +244,15 @@ export interface RegisterCompactionOptions {
  */
 export function registerCompactionHandler(
   host: unknown,
-  opts: RegisterCompactionOptions,
+  opts: RegisterCompactionOptions
 ): { registered: boolean; reason: string } {
   // Whole body inside try: any unexpected throw maps to register-failed, never escapes.
   try {
-    // Opts guard first: bad input gets a reason, never a TypeError.
+    // Opts guards first: bad input gets a reason string, never a TypeError.
     if (opts === null || typeof opts !== 'object') {
       return { registered: false, reason: 'invalid-opts' };
     }
-    if (
-      typeof opts.projectDir !== 'string' ||
-      opts.projectDir.trim().length === 0
-    ) {
+    if (typeof opts.projectDir !== 'string' || opts.projectDir.trim().length === 0) {
       return { registered: false, reason: 'invalid-opts' };
     }
     // Host guard before any dereference: null hosts get unavailable, never TypeError.
@@ -322,11 +261,7 @@ export function registerCompactionHandler(
     }
     const hooks = getAvailableHooks(host);
     const hasCompact = hooks.includes('onCompact');
-    const h = host as {
-      onCompact?: unknown;
-      onSessionResume?: unknown;
-      onSessionStart?: unknown;
-    };
+    const h = host as { onCompact?: unknown; onSessionResume?: unknown; onSessionStart?: unknown };
     const resumeFn =
       typeof h.onSessionResume === 'function'
         ? (h.onSessionResume as (cb: () => Promise<void>) => void)
@@ -365,4 +300,224 @@ export function registerCompactionHandler(
   }
 }
 
-export default plugin;
+/**
+ * Build the work instruction posted when a goal is set through the V2 command.
+ * The instruction carries the objective plus the stop verbs so the agent loop
+ * knows how to report done, stuck, or cancelled.
+ * @param objective active objective text
+ * @param iterationCount current turn count for context
+ */
+export function buildGoalWorkInstruction(objective: string, iterationCount: number): string {
+  return (
+    'Goal accepted: "' + objective + '" (turn ' + String(iterationCount + 1) + ').\n' +
+    'Work toward it now with concrete steps.\n' +
+    'When done, finish with evidence and call /goal complete. ' +
+    'If blocked, call /goal block <reason>. To cancel, call /goal clear.'
+  );
+}
+
+/**
+ * Resolve the project directory for file state from a V2 context.
+ * Falls back to the process working directory when the host gives none.
+ * @param ctx unknown V2 plugin context
+ */
+export function resolveProjectDir(ctx: unknown): string {
+  try {
+    const c = ctx as { location?: { directory?: unknown } };
+    if (typeof c.location?.directory === 'string' && c.location.directory.length > 0) {
+      return c.location.directory;
+    }
+  } catch {
+    // Fall through to the working directory default.
+  }
+  return process.cwd();
+}
+
+/**
+ * Post a best-effort visible message to a session without throwing.
+ * @param session host session domain with a synthetic prompt call
+ * @param sessionID target session id
+ * @param text message text
+ */
+async function notifySynthetic(
+  session: { synthetic?: (args: { sessionID: string; text: string }) => Promise<unknown> },
+  sessionID: string,
+  text: string
+): Promise<void> {
+  try {
+    if (typeof session.synthetic === 'function') {
+      await session.synthetic({ sessionID, text });
+    }
+  } catch {
+    // Synthetic delivery is best-effort; never fail hosting over it.
+  }
+}
+
+/**
+ * OpenCode V2 plugin definition. The host loader validates this exact shape:
+ * a default export with an id plus a setup function.
+ */
+export default Plugin.define({
+  id: PLUGIN_NAME,
+  async setup(ctx) {
+    const projectDir = resolveProjectDir(ctx);
+    const clock = new SystemClock();
+    const ownerId = 'v2-' + String(process.pid) + '-' + String(Math.floor(Math.random() * 1000000));
+    const hasStopFile = defaultHasStopFile(projectDir);
+
+    // Slash goal command: set drives work, the rest report status.
+    try {
+      const cmd = (ctx as { command?: { transform?: unknown } }).command;
+      if (cmd !== null && typeof cmd === 'object' && typeof (cmd as { transform?: unknown }).transform === 'function') {
+        await (
+          cmd as {
+            transform: (fn: (editor: { add: (d: { name: string; description: string; execute: (i: unknown) => Promise<void> }) => void }) => void) => Promise<unknown>;
+          }
+        ).transform((editor) => {
+          editor.add({
+            name: 'goal',
+            description: 'Set a session goal and auto-continue until complete, blocked, or cleared.',
+            execute: async (invocation: unknown) => {
+              try {
+                const inv = invocation as { sessionID?: unknown; prompt?: { text?: unknown } };
+                const sessionID = typeof inv.sessionID === 'string' ? inv.sessionID : '';
+                const text = typeof inv.prompt?.text === 'string' ? (inv.prompt.text as string) : '';
+                const parsed = parseGoalCommand('/goal ' + text);
+                if (parsed.kind === 'set') {
+                  const statePath = resolveStatePath(projectDir);
+                  const current = await loadGoalState(statePath).catch(() => null);
+                  const next = setObjective(current, parsed.objective, clock, '2.0.29');
+                  await saveGoalState(statePath, next);
+                  // Seed evidence shell so completion checks have a file from turn one.
+                  await saveEvidence(projectDir, emptyEvidence(clock.nowMs())).catch(() => undefined);
+                  if (sessionID !== '') {
+                    await (ctx as { session?: { prompt?: (a: unknown) => Promise<unknown> } }).session
+                      ?.prompt?.({ sessionID, text: buildGoalWorkInstruction(next.objective, next.iterationCount) })
+                      .catch(() => undefined);
+                  }
+                  return;
+                }
+                // Status, block, complete, and clear reuse the guarded handler, then report.
+                const message = await handleGoalCommand('/goal ' + text, projectDir, clock);
+                if (sessionID !== '') {
+                  const session = (ctx as { session?: { synthetic?: (a: { sessionID: string; text: string }) => Promise<unknown> } }).session;
+                  if (session !== undefined) await notifySynthetic(session, sessionID, message);
+                }
+              } catch {
+                // Command failures stay local; the host loop continues.
+              }
+            },
+          });
+        });
+      }
+    } catch {
+      // Command registration is best-effort; idle and hooks still arm below.
+    }
+
+    // Idle auto-continue: one safe turn per session idle tick.
+    const controller = new AbortController();
+    const idleTask = (async () => {
+      try {
+        const events = (ctx as { event?: { subscribe?: (a: unknown) => AsyncIterable<unknown> } }).event;
+        if (events === undefined || typeof events.subscribe !== 'function') return;
+        const stream = events.subscribe({ signal: controller.signal }) as AsyncIterable<{
+          type?: unknown;
+          data?: { sessionID?: unknown };
+          properties?: { sessionID?: unknown };
+        }>;
+        for await (const event of stream) {
+          try {
+            if (event === null || typeof event !== 'object') continue;
+            if ((event as { type?: unknown }).type !== 'session.idle') continue;
+            const data = (event as { data?: { sessionID?: unknown } }).data;
+            const props = (event as { properties?: { sessionID?: unknown } }).properties;
+            const rawID = data?.sessionID ?? props?.sessionID;
+            if (typeof rawID !== 'string' || rawID.length === 0) continue;
+            const session = (ctx as { session?: { prompt?: (a: unknown) => Promise<unknown> } }).session;
+            if (session === undefined || typeof session.prompt !== 'function') continue;
+            const promptFn = session.prompt.bind(session);
+            const deps = {
+              clock,
+              limits: DEFAULT_LIMITS,
+              ownerId,
+              loadState: loadGoalState,
+              saveState: saveGoalState,
+              tryClaim: tryClaimLease,
+              sendPrompt: async (prompt: string) => {
+                const res = (await promptFn({ sessionID: rawID, text: prompt }).catch(() => null)) as {
+                  messageID?: unknown;
+                  tokenSpend?: unknown;
+                } | null;
+                const messageID = typeof res?.messageID === 'string' && res.messageID.length > 0 ? res.messageID : 'turn-unlabeled';
+                const tokenSpend = typeof res?.tokenSpend === 'number' ? res.tokenSpend : 0;
+                return { messageId: messageID, tokenSpend };
+              },
+              hasStopFile,
+            };
+            await handleSessionIdle({ projectDir, lastMessageId: null }, deps);
+          } catch {
+            // One bad tick never kills the subscription.
+          }
+        }
+      } catch {
+        // Stream end or abort: quiet exit.
+      }
+    })();
+
+    // Compaction survival: re-inject the goal summary from file state, never send.
+    try {
+      const session = (ctx as { session?: { hook?: (n: string, f: (e: unknown) => void) => Promise<unknown> } }).session;
+      if (session !== undefined && typeof session.hook === 'function') {
+        await session
+          .hook('compaction', (event: unknown) => {
+            try {
+              const e = event as { sessionID?: unknown; messages?: unknown };
+              if (typeof e.sessionID !== 'string') return;
+              void loadGoalState(resolveStatePath(projectDir))
+                .then((state) => {
+                  if (state === null || state.status !== 'active') return;
+                  if (!Array.isArray(e.messages)) return;
+                  e.messages.push({
+                    role: 'user',
+                    content: 'Restored goal after compaction: "' + state.objective + '" (turn ' + String(state.iterationCount) + '). Continue it.',
+                  });
+                })
+                .catch(() => undefined);
+            } catch {
+              // Never break host compaction.
+            }
+          })
+          .catch(() => undefined);
+        // Context injection: remind every model request of the active goal.
+        await session
+          .hook('context', (event: unknown) => {
+            try {
+              const e = event as { system?: unknown };
+              void loadGoalState(resolveStatePath(projectDir))
+                .then((state) => {
+                  if (state === null || state.status !== 'active') return;
+                  if (!Array.isArray(e.system)) return;
+                  e.system.push({ type: 'text', text: 'Active goal: "' + state.objective + '". Finish with evidence, or report blocked.' });
+                })
+                .catch(() => undefined);
+            } catch {
+              // Never break the model request.
+            }
+          })
+          .catch(() => undefined);
+      }
+    } catch {
+      // Hook registration is best-effort on hosts without these hooks.
+    }
+
+    // Cleanup on unload: stop the event stream.
+    return () => {
+      try {
+        controller.abort();
+      } catch {
+        // Abort is best-effort during unload.
+      }
+      void idleTask.catch(() => undefined);
+    };
+  },
+});
