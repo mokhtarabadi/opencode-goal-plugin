@@ -1,5 +1,11 @@
 # Changelog
 All notable changes follow Keep a Changelog.
+## [Unreleased]
+### Added
+- Evidence traversal guard rejecting dot-dot escapes.
+- Subagent dispatch tests for pass, fail, and throw paths.
+- MIT LICENSE plus install docs for all four surfaces.
+- Version note: package stays 0.2.0 during Night Work and sync to 0.3.0 is gated to morning publish with token plus live matrix.
 ## [0.3.0] - 2026-10-16
 ### Added
 - Compaction snapshot plus restore with restoreCount audit and cooldown clamp.

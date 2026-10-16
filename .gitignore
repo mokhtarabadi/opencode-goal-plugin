@@ -3,3 +3,5 @@ dist/
 .opencode/goal-state.json
 context-reports/
 tmp-clones/
+evidence/*.log
+evidence/*.tgz

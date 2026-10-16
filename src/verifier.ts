@@ -8,6 +8,40 @@ import path from 'node:path';
 import type { GoalEvidenceFile } from './evidence.js';
 import { validateEvidenceShape, hashEvidence } from './evidence.js';
 
+/**
+ * Return true only when a citation resolves to a file inside projectDir.
+ * Rejects empty, dot, absolute escapes, and dot-dot traversal, plus any
+ * non-string input, so evidence cannot cite outside the verified project.
+ * @param projectDir absolute project root
+ * @param citation cited path, relative or absolute
+ */
+export function isCitationInsideProjectDir(projectDir: string, citation: string): boolean {
+  try {
+    // Non-string JSON values fail closed instead of throwing in path calls.
+    if (typeof citation !== 'string') {
+      return false;
+    }
+    if (citation.trim() === '') {
+      return false;
+    }
+    // Resolve both sides: a citation escaping via dot-dot lands outside base.
+    const base = path.resolve(projectDir);
+    const target = path.resolve(base, citation);
+    const rel = path.relative(base, target);
+    // Empty or dot relative means the project dir itself, not a file: reject.
+    if (rel === '' || rel === '.') {
+      return false;
+    }
+    // Exact parent segments only: names merely starting with two dots stay inside.
+    if (rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel)) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Local verification outcome. Verifier errors keep goal active. */
 export interface LocalVerifyResult {
   ok: boolean;
@@ -56,10 +90,20 @@ export async function verifyLocal(
   const failures: string[] = [];
   for (const c of evidence.criteria) {
     for (const f of c.files) {
+      // Traversal guard first: outside citations fail without filesystem reads.
+      if (!isCitationInsideProjectDir(projectDir, f)) {
+        failures.push('traversal-escape:' + c.id + ':' + String(f));
+        continue;
+      }
       try {
-        await fs.access(path.isAbsolute(f) ? f : path.join(projectDir, f));
+        // Require a real file: directories and missing paths both fail proof.
+        const p = path.isAbsolute(f) ? f : path.join(projectDir, f);
+        const st = await fs.stat(p);
+        if (!st.isFile()) {
+          failures.push('not-a-file:' + c.id + ':' + String(f));
+        }
       } catch {
-        failures.push('missing-file:' + c.id + ':' + f);
+        failures.push('missing-file:' + c.id + ':' + String(f));
       }
     }
     // Each criterion needs at least one passing test proof.
