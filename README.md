@@ -26,4 +26,4 @@ Missing host hooks fail closed with a reason and never crash the host.
 Kill switch: create `.opencode/STOP_GOAL` to stop the loop immediately.
 Completion: `/goal complete` needs evidence in `.opencode/goal-evidence.json` with file citations plus passing test proof. Compaction-safe: state reloads from file and resumes without double send.
 State: `.opencode/goal-state.json` with UTC epoch ms.
-Build: npm run typecheck, npm test, npm run build.
+Build: npm run typecheck, npm test, npm run compile.
