@@ -5,10 +5,23 @@
  */
 import * as path from 'node:path';
 import { promises as fs } from 'node:fs';
-import { SystemClock, loadGoalState, resolveStatePath, saveGoalState, tryClaimLease } from './state.js';
+import {
+  SystemClock,
+  loadGoalState,
+  resolveStatePath,
+  saveGoalState,
+  tryClaimLease,
+} from './state.js';
 import type { Clock, GoalState } from './state.js';
-import { blockGoal, clearGoal, completeGoal, parseGoalCommand, setObjective } from './goal.js';
+import {
+  blockGoal,
+  clearGoal,
+  completeGoal,
+  parseGoalCommand,
+  setObjective,
+} from './goal.js';
 import { handleSessionIdle } from './loop.js';
+import { snapshotForCompaction, restoreAfterCompaction } from './compaction.js';
 import { DEFAULT_LIMITS, STOP_FILE_NAME } from './limits.js';
 import type { Limits } from './limits.js';
 
@@ -56,7 +69,7 @@ export async function handleGoalCommand(
   rawInput: string,
   projectDir: string,
   clock: Clock = new SystemClock(),
-  hostVersion: string = '2.0.29'
+  hostVersion: string = '2.0.29',
 ): Promise<string> {
   // Type guards first: a misbehaving host gets a message, never a TypeError.
   if (typeof rawInput !== 'string') {
@@ -76,7 +89,11 @@ export async function handleGoalCommand(
     current = await loadGoalState(statePath);
   } catch {
     // Corrupt JSON or shape mismatch: point at the file, do not throw.
-    return 'Goal state is corrupt at ' + statePath + '. Back up the file then clear it.';
+    return (
+      'Goal state is corrupt at ' +
+      statePath +
+      '. Back up the file then clear it.'
+    );
   }
   if (parsed.kind === 'status') {
     if (current === null) return 'No goal set. Use /goal <objective>.';
@@ -101,7 +118,11 @@ export async function handleGoalCommand(
     try {
       next = blockGoal(current, parsed.reason, clock);
     } catch {
-      return 'Only an active goal can be blocked. Current status: ' + current.status + '.';
+      return (
+        'Only an active goal can be blocked. Current status: ' +
+        current.status +
+        '.'
+      );
     }
     try {
       await saveGoalState(statePath, next);
@@ -115,7 +136,11 @@ export async function handleGoalCommand(
     try {
       next = completeGoal(current, clock);
     } catch {
-      return 'Only an active goal can complete. Current status: ' + current.status + '.';
+      return (
+        'Only an active goal can complete. Current status: ' +
+        current.status +
+        '.'
+      );
     }
     try {
       await saveGoalState(statePath, next);
@@ -144,7 +169,9 @@ export function handleIdleStub(): string {
 export interface RegisterIdleOptions {
   projectDir: string;
   getLastMessageId: () => string | null;
-  sendPrompt: (prompt: string) => Promise<{ messageId: string; tokenSpend?: number }>;
+  sendPrompt: (
+    prompt: string,
+  ) => Promise<{ messageId: string; tokenSpend?: number }>;
   clock?: Clock;
   limits?: Limits;
   ownerId?: string;
@@ -174,15 +201,24 @@ export function defaultHasStopFile(projectDir: string): () => Promise<boolean> {
  * @param host unknown host object from OpenCode V2
  * @param opts project dir plus host callbacks
  */
-export function registerIdleHandler(host: unknown, opts: RegisterIdleOptions): { registered: boolean; reason: string } {
+export function registerIdleHandler(
+  host: unknown,
+  opts: RegisterIdleOptions,
+): { registered: boolean; reason: string } {
   // Opts guards first: bad input gets a reason string, never a TypeError.
   if (opts === null || typeof opts !== 'object') {
     return { registered: false, reason: 'invalid-opts' };
   }
-  if (typeof opts.projectDir !== 'string' || opts.projectDir.trim().length === 0) {
+  if (
+    typeof opts.projectDir !== 'string' ||
+    opts.projectDir.trim().length === 0
+  ) {
     return { registered: false, reason: 'invalid-opts' };
   }
-  if (typeof opts.getLastMessageId !== 'function' || typeof opts.sendPrompt !== 'function') {
+  if (
+    typeof opts.getLastMessageId !== 'function' ||
+    typeof opts.sendPrompt !== 'function'
+  ) {
     return { registered: false, reason: 'invalid-opts' };
   }
   // Probe first so unknown hosts get a reason string, never an exception.
@@ -197,7 +233,12 @@ export function registerIdleHandler(host: unknown, opts: RegisterIdleOptions): {
   const clock = opts.clock ?? new SystemClock();
   const limits = opts.limits ?? DEFAULT_LIMITS;
   // Random owner suffix separates this process from other loop runners.
-  const ownerId = opts.ownerId ?? ('idle-' + String(process.pid) + '-' + String(Math.floor(Math.random() * 1000000)));
+  const ownerId =
+    opts.ownerId ??
+    'idle-' +
+      String(process.pid) +
+      '-' +
+      String(Math.floor(Math.random() * 1000000));
   if (typeof ownerId !== 'string' || ownerId.length === 0) {
     return { registered: false, reason: 'invalid-opts' };
   }
@@ -211,7 +252,16 @@ export function registerIdleHandler(host: unknown, opts: RegisterIdleOptions): {
       lastId = null;
     }
     const ctx = { projectDir: opts.projectDir, lastMessageId: lastId };
-    const deps = { clock, limits, ownerId, loadState: loadGoalState, saveState: saveGoalState, tryClaim: tryClaimLease, sendPrompt: opts.sendPrompt, hasStopFile };
+    const deps = {
+      clock,
+      limits,
+      ownerId,
+      loadState: loadGoalState,
+      saveState: saveGoalState,
+      tryClaim: tryClaimLease,
+      sendPrompt: opts.sendPrompt,
+      hasStopFile,
+    };
     try {
       await handleSessionIdle(ctx, deps);
     } catch {
@@ -233,7 +283,86 @@ const plugin = {
   handleGoalCommand,
   handleIdleStub,
   registerIdleHandler,
-  defaultHasStopFile
+  defaultHasStopFile,
+  registerCompactionHandler,
 };
+
+/** Options for compaction registration. */
+export interface RegisterCompactionOptions {
+  projectDir: string;
+  clock?: Clock;
+}
+
+/**
+ * Register compaction snapshot plus resume handlers when the host supports them.
+ * Probes onCompact plus onSessionResume plus onSessionStart and fails closed
+ * with a reason when none exist. Snapshot and restore never send and never claim.
+ * @param host unknown host object from OpenCode V2
+ * @param opts project dir plus optional clock
+ */
+export function registerCompactionHandler(
+  host: unknown,
+  opts: RegisterCompactionOptions,
+): { registered: boolean; reason: string } {
+  // Whole body inside try: any unexpected throw maps to register-failed, never escapes.
+  try {
+    // Opts guard first: bad input gets a reason, never a TypeError.
+    if (opts === null || typeof opts !== 'object') {
+      return { registered: false, reason: 'invalid-opts' };
+    }
+    if (
+      typeof opts.projectDir !== 'string' ||
+      opts.projectDir.trim().length === 0
+    ) {
+      return { registered: false, reason: 'invalid-opts' };
+    }
+    // Host guard before any dereference: null hosts get unavailable, never TypeError.
+    if (host === null || typeof host !== 'object') {
+      return { registered: false, reason: 'compaction-hook-unavailable' };
+    }
+    const hooks = getAvailableHooks(host);
+    const hasCompact = hooks.includes('onCompact');
+    const h = host as {
+      onCompact?: unknown;
+      onSessionResume?: unknown;
+      onSessionStart?: unknown;
+    };
+    const resumeFn =
+      typeof h.onSessionResume === 'function'
+        ? (h.onSessionResume as (cb: () => Promise<void>) => void)
+        : typeof h.onSessionStart === 'function'
+          ? (h.onSessionStart as (cb: () => Promise<void>) => void)
+          : null;
+    if (!hasCompact && resumeFn === null) {
+      return { registered: false, reason: 'compaction-hook-unavailable' };
+    }
+    const clock = opts.clock ?? new SystemClock();
+    const statePath = resolveStatePath(opts.projectDir);
+    const store = { loadState: loadGoalState, saveState: saveGoalState };
+    // Snapshot flushes hot state to disk before compaction wipes memory.
+    if (hasCompact && typeof h.onCompact === 'function') {
+      (h.onCompact as (cb: () => Promise<void>) => void)(async () => {
+        try {
+          await snapshotForCompaction(statePath, clock, store);
+        } catch {
+          // Snapshot failure must not break host compaction.
+        }
+      });
+    }
+    // Resume reloads file state and bumps restoreCount; the next idle tick decides.
+    if (resumeFn !== null) {
+      (resumeFn as (cb: () => Promise<void>) => void)(async () => {
+        try {
+          await restoreAfterCompaction(statePath, clock, store);
+        } catch {
+          // Restore failure leaves file state untouched for the next idle load.
+        }
+      });
+    }
+    return { registered: true, reason: 'ok' };
+  } catch {
+    return { registered: false, reason: 'register-failed' };
+  }
+}
 
 export default plugin;

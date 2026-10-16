@@ -40,8 +40,15 @@ export interface IdleDeps {
   ownerId: string;
   loadState: (p: string) => Promise<GoalState | null>;
   saveState: (p: string, s: GoalState) => Promise<void>;
-  tryClaim: (p: string, owner: string, ttl: number, c: Clock) => Promise<{ claimed: boolean; state: GoalState | null }>;
-  sendPrompt: (prompt: string) => Promise<{ messageId: string; tokenSpend?: number }>;
+  tryClaim: (
+    p: string,
+    owner: string,
+    ttl: number,
+    c: Clock,
+  ) => Promise<{ claimed: boolean; state: GoalState | null }>;
+  sendPrompt: (
+    prompt: string,
+  ) => Promise<{ messageId: string; tokenSpend?: number }>;
   hasStopFile: () => Promise<boolean>;
 }
 
@@ -74,19 +81,30 @@ export function shouldContinue(
   nowMs: number,
   lastMessageId: string | null,
   limits: Limits,
-  opts?: { stopRequested?: boolean }
+  opts?: { stopRequested?: boolean },
 ): { ok: boolean; reason: string } {
   if (state === null) return { ok: false, reason: 'no-state' };
-  if (state.status !== 'active') return { ok: false, reason: 'stopped-' + state.status };
+  if (state.status !== 'active')
+    return { ok: false, reason: 'stopped-' + state.status };
+  // Verification in flight pauses auto turns without stopping the goal.
+  if (state.pendingVerification === true)
+    return { ok: false, reason: 'verification-pending' };
   if (opts?.stopRequested === true) return { ok: false, reason: 'stop-file' };
   // A message id that moved past our last continuation means the human spoke: yield.
-  if (state.lastContinuedMessageId !== '' && lastMessageId !== null && lastMessageId !== state.lastContinuedMessageId) {
+  if (
+    state.lastContinuedMessageId !== '' &&
+    lastMessageId !== null &&
+    lastMessageId !== state.lastContinuedMessageId
+  ) {
     return { ok: false, reason: 'human-message' };
   }
   const budget = checkBudget(state, nowMs, limits);
   if (!budget.ok) return budget;
   // First turn (lastTurnAtMs 0) always bypasses cooldown so goals start promptly.
-  if (state.lastTurnAtMs !== 0 && nowMs - state.lastTurnAtMs < limits.minDelayMs) {
+  if (
+    state.lastTurnAtMs !== 0 &&
+    nowMs - state.lastTurnAtMs < limits.minDelayMs
+  ) {
     return { ok: false, reason: 'cooldown' };
   }
   return { ok: true, reason: 'ok' };
@@ -99,8 +117,16 @@ export function shouldContinue(
 export function buildContinuationPrompt(state: GoalState): string {
   const summary = state.lastSummary !== '' ? state.lastSummary : 'none yet';
   return (
-    'Continue goal: "' + state.objective + '"\n' +
-    'Status: ' + state.status + ' | Turn: ' + String(state.iterationCount + 1) + ' | Last: ' + summary + '\n' +
+    'Continue goal: "' +
+    state.objective +
+    '"\n' +
+    'Status: ' +
+    state.status +
+    ' | Turn: ' +
+    String(state.iterationCount + 1) +
+    ' | Last: ' +
+    summary +
+    '\n' +
     'Take exactly one concrete next step toward the objective.\n' +
     'If done call /goal complete. If stuck call /goal block <reason>. To cancel call /goal clear.\n' +
     'Do not repeat questions. Keep output concise.'
@@ -115,8 +141,13 @@ export function buildContinuationPrompt(state: GoalState): string {
  */
 export function recordTurnResult(
   state: GoalState,
-  result: { messageId: string; tokenSpend?: number; elapsedMs?: number; summary?: string },
-  clock: Clock
+  result: {
+    messageId: string;
+    tokenSpend?: number;
+    elapsedMs?: number;
+    summary?: string;
+  },
+  clock: Clock,
 ): GoalState {
   const now = clock.nowMs();
   return {
@@ -127,7 +158,7 @@ export function recordTurnResult(
     tokenSpend: state.tokenSpend + safeSpend(result.tokenSpend),
     wallTimeMs: state.wallTimeMs + (result.elapsedMs ?? 0),
     lastSummary: result.summary ?? state.lastSummary,
-    updatedAtMs: now
+    updatedAtMs: now,
   };
 }
 
@@ -137,7 +168,10 @@ export function recordTurnResult(
  * @param ctx project dir plus last message id
  * @param deps injected clock plus storage plus sender
  */
-export async function handleSessionIdle(ctx: IdleContext, deps: IdleDeps): Promise<IdleDecision> {
+export async function handleSessionIdle(
+  ctx: IdleContext,
+  deps: IdleDeps,
+): Promise<IdleDecision> {
   // Same-process reentry exits first so parallel ticks send exactly once.
   if (idleInFlight) {
     return { decision: 'skipped', reason: 'idle-inflight' };
@@ -149,20 +183,33 @@ export async function handleSessionIdle(ctx: IdleContext, deps: IdleDeps): Promi
   if (deps === null || typeof deps !== 'object') {
     return { decision: 'stopped', reason: 'invalid-deps' };
   }
-  if (typeof ctx.projectDir !== 'string' || ctx.projectDir.trim().length === 0) {
+  if (
+    typeof ctx.projectDir !== 'string' ||
+    ctx.projectDir.trim().length === 0
+  ) {
     return { decision: 'stopped', reason: 'invalid-project-dir' };
   }
-  if (typeof deps.loadState !== 'function' || typeof deps.saveState !== 'function') {
+  if (
+    typeof deps.loadState !== 'function' ||
+    typeof deps.saveState !== 'function'
+  ) {
     return { decision: 'stopped', reason: 'invalid-deps' };
   }
-  if (typeof deps.tryClaim !== 'function' || typeof deps.sendPrompt !== 'function') {
+  if (
+    typeof deps.tryClaim !== 'function' ||
+    typeof deps.sendPrompt !== 'function'
+  ) {
     return { decision: 'stopped', reason: 'invalid-deps' };
   }
   if (typeof deps.hasStopFile !== 'function') {
     return { decision: 'stopped', reason: 'invalid-deps' };
   }
   // Clock check: a missing clock would throw TypeError on nowMs.
-  if (deps.clock === null || typeof deps.clock !== 'object' || typeof deps.clock.nowMs !== 'function') {
+  if (
+    deps.clock === null ||
+    typeof deps.clock !== 'object' ||
+    typeof deps.clock.nowMs !== 'function'
+  ) {
     return { decision: 'stopped', reason: 'invalid-deps' };
   }
   if (deps.limits === null || typeof deps.limits !== 'object') {
@@ -196,7 +243,13 @@ export async function handleSessionIdle(ctx: IdleContext, deps: IdleDeps): Promi
       // Fail closed: a filesystem error must not silently ignore STOP_GOAL.
       return { decision: 'stopped', reason: 'stop-check-failed' };
     }
-    const gate = shouldContinue(current, now, ctx.lastMessageId ?? null, deps.limits, { stopRequested });
+    const gate = shouldContinue(
+      current,
+      now,
+      ctx.lastMessageId ?? null,
+      deps.limits,
+      { stopRequested },
+    );
     if (!gate.ok) {
       // No-goal and finished goals stop the loop; cooldown and contention only skip one tick.
       const terminal =
@@ -205,11 +258,19 @@ export async function handleSessionIdle(ctx: IdleContext, deps: IdleDeps): Promi
         gate.reason === 'max-turns' ||
         gate.reason === 'wall-time' ||
         gate.reason === 'stop-file';
-      return { decision: terminal ? 'stopped' : 'skipped', reason: gate.reason };
+      return {
+        decision: terminal ? 'stopped' : 'skipped',
+        reason: gate.reason,
+      };
     }
     let claimed: { claimed: boolean; state: GoalState | null };
     try {
-      claimed = await deps.tryClaim(statePath, deps.ownerId, LEASE_TTL_MS, deps.clock);
+      claimed = await deps.tryClaim(
+        statePath,
+        deps.ownerId,
+        LEASE_TTL_MS,
+        deps.clock,
+      );
     } catch {
       // Lock I/O failure stops this tick instead of escaping to the host.
       return { decision: 'stopped', reason: 'claim-failed' };
@@ -224,16 +285,31 @@ export async function handleSessionIdle(ctx: IdleContext, deps: IdleDeps): Promi
     } catch {
       // Send failure clears our lease so the next tick can retry, then stops this tick.
       try {
-        await deps.saveState(statePath, { ...claimed.state, leaseOwner: null, leaseExpiresAtMs: 0, updatedAtMs: deps.clock.nowMs() });
+        await deps.saveState(statePath, {
+          ...claimed.state,
+          leaseOwner: null,
+          leaseExpiresAtMs: 0,
+          updatedAtMs: deps.clock.nowMs(),
+        });
       } catch {
         // Cleanup failure keeps the original send failure as the reported reason.
       }
       return { decision: 'stopped', reason: 'send-failed' };
     }
     // Validate the send result: an empty id would poison human-message yield next tick.
-    if (typeof sent !== 'object' || sent === null || typeof sent.messageId !== 'string' || sent.messageId.length === 0) {
+    if (
+      typeof sent !== 'object' ||
+      sent === null ||
+      typeof sent.messageId !== 'string' ||
+      sent.messageId.length === 0
+    ) {
       try {
-        await deps.saveState(statePath, { ...claimed.state, leaseOwner: null, leaseExpiresAtMs: 0, updatedAtMs: deps.clock.nowMs() });
+        await deps.saveState(statePath, {
+          ...claimed.state,
+          leaseOwner: null,
+          leaseExpiresAtMs: 0,
+          updatedAtMs: deps.clock.nowMs(),
+        });
       } catch {
         // Same cleanup path as a thrown send failure.
       }
@@ -249,7 +325,7 @@ export async function handleSessionIdle(ctx: IdleContext, deps: IdleDeps): Promi
       tokenSpend: claimed.state.tokenSpend + safeSpend(sent.tokenSpend),
       updatedAtMs: afterSend,
       leaseOwner: null,
-      leaseExpiresAtMs: 0
+      leaseExpiresAtMs: 0,
     };
     try {
       await deps.saveState(statePath, next);

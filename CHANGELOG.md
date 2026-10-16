@@ -1,5 +1,12 @@
 # Changelog
 All notable changes follow Keep a Changelog.
+## [0.3.0] - 2026-10-16
+### Added
+- Compaction snapshot plus restore with restoreCount audit and cooldown clamp.
+- Evidence sidecar schema plus local verifier plus optional subagent dispatch.
+### Fixed
+- Verification-pending pauses auto turns without stopping the goal.
+- Compaction registration never throws: whole body inside try plus null host guard.
 ## [0.2.0] - 2026-10-16
 ### Added
 - Idle auto-continue loop with single send per tick plus cooldown plus max turns plus wall time.

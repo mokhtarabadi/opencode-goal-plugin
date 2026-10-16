@@ -36,6 +36,12 @@ export interface GoalState {
   hostVersion: string;
   lastTurnAtMs: number;
   lastContinuedMessageId: string;
+  restoreCount: number;
+  evidencePath: string;
+  evidenceHash: string | null;
+  pendingVerification: boolean;
+  verificationFailReason: string | null;
+  revisionCount: number;
 }
 
 export const STATE_FILENAME = 'goal-state.json';
@@ -56,7 +62,11 @@ export function resolveStatePath(projectDir: string): string {
  * @param clock injected clock for timestamps
  * @param hostVersion host version string for compat audit
  */
-export function initialState(objective: string, clock: Clock, hostVersion: string): GoalState {
+export function initialState(
+  objective: string,
+  clock: Clock,
+  hostVersion: string,
+): GoalState {
   // Validate early so invalid objectives never reach disk.
   const trimmed = objective.trim();
   if (trimmed.length === 0) {
@@ -76,7 +86,13 @@ export function initialState(objective: string, clock: Clock, hostVersion: strin
     updatedAtMs: now,
     hostVersion,
     lastTurnAtMs: 0,
-    lastContinuedMessageId: ''
+    lastContinuedMessageId: '',
+    restoreCount: 0,
+    evidencePath: '',
+    evidenceHash: null,
+    pendingVerification: false,
+    verificationFailReason: null,
+    revisionCount: 0,
   };
 }
 
@@ -90,20 +106,61 @@ function isValidState(value: unknown): value is GoalState {
   // Explicit field checks prevent corrupt files from crashing the loop.
   if (typeof value !== 'object' || value === null) return false;
   const v = value as Record<string, unknown>;
-  if (typeof v['objective'] !== 'string' || (v['objective'] as string).length === 0) return false;
-  if (v['status'] !== 'active' && v['status'] !== 'complete' && v['status'] !== 'blocked' && v['status'] !== 'cleared') return false;
+  if (
+    typeof v['objective'] !== 'string' ||
+    (v['objective'] as string).length === 0
+  )
+    return false;
+  if (
+    v['status'] !== 'active' &&
+    v['status'] !== 'complete' &&
+    v['status'] !== 'blocked' &&
+    v['status'] !== 'cleared'
+  )
+    return false;
   if (typeof v['iterationCount'] !== 'number') return false;
   if (typeof v['tokenSpend'] !== 'number') return false;
   if (typeof v['wallTimeMs'] !== 'number') return false;
-  if (!(typeof v['leaseOwner'] === 'string' || v['leaseOwner'] === null)) return false;
+  if (!(typeof v['leaseOwner'] === 'string' || v['leaseOwner'] === null))
+    return false;
   if (typeof v['leaseExpiresAtMs'] !== 'number') return false;
   if (typeof v['lastSummary'] !== 'string') return false;
   if (typeof v['createdAtMs'] !== 'number') return false;
   if (typeof v['updatedAtMs'] !== 'number') return false;
   if (typeof v['hostVersion'] !== 'string') return false;
   // Phase 2 fields stay optional so Phase 1 files load, then normalize fills them.
-  if ('lastTurnAtMs' in v && typeof v['lastTurnAtMs'] !== 'number') return false;
-  if ('lastContinuedMessageId' in v && typeof v['lastContinuedMessageId'] !== 'string') return false;
+  if ('lastTurnAtMs' in v && typeof v['lastTurnAtMs'] !== 'number')
+    return false;
+  if (
+    'lastContinuedMessageId' in v &&
+    typeof v['lastContinuedMessageId'] !== 'string'
+  )
+    return false;
+  // Phase 3 fields stay optional so older files load, then normalize fills them.
+  if ('restoreCount' in v && typeof v['restoreCount'] !== 'number')
+    return false;
+  if ('evidencePath' in v && typeof v['evidencePath'] !== 'string')
+    return false;
+  if (
+    'evidenceHash' in v &&
+    !(typeof v['evidenceHash'] === 'string' || v['evidenceHash'] === null)
+  )
+    return false;
+  if (
+    'pendingVerification' in v &&
+    typeof v['pendingVerification'] !== 'boolean'
+  )
+    return false;
+  if (
+    'verificationFailReason' in v &&
+    !(
+      typeof v['verificationFailReason'] === 'string' ||
+      v['verificationFailReason'] === null
+    )
+  )
+    return false;
+  if ('revisionCount' in v && typeof v['revisionCount'] !== 'number')
+    return false;
   return true;
 }
 
@@ -112,11 +169,17 @@ function isValidState(value: unknown): value is GoalState {
  * @param input validated state possibly missing new fields
  */
 export function normalizeState(input: GoalState): GoalState {
-  // Nullish fallback fills runtime-undefined fields from Phase 1 files.
+  // Nullish fallback fills runtime-undefined fields from older phase files.
   return {
     ...input,
     lastTurnAtMs: input.lastTurnAtMs ?? 0,
-    lastContinuedMessageId: input.lastContinuedMessageId ?? ''
+    lastContinuedMessageId: input.lastContinuedMessageId ?? '',
+    restoreCount: input.restoreCount ?? 0,
+    evidencePath: input.evidencePath ?? '',
+    evidenceHash: input.evidenceHash ?? null,
+    pendingVerification: input.pendingVerification ?? false,
+    verificationFailReason: input.verificationFailReason ?? null,
+    revisionCount: input.revisionCount ?? 0,
   };
 }
 
@@ -124,7 +187,9 @@ export function normalizeState(input: GoalState): GoalState {
  * Load state from disk, return null if missing.
  * @param statePath absolute path to goal-state.json
  */
-export async function loadGoalState(statePath: string): Promise<GoalState | null> {
+export async function loadGoalState(
+  statePath: string,
+): Promise<GoalState | null> {
   try {
     // Read raw file, missing file means no active goal, not an error.
     const raw = await fs.readFile(statePath, 'utf8');
@@ -150,7 +215,10 @@ let tmpCounter = 0;
  * @param statePath absolute path to goal-state.json
  * @param state state to persist
  */
-export async function saveGoalState(statePath: string, state: GoalState): Promise<void> {
+export async function saveGoalState(
+  statePath: string,
+  state: GoalState,
+): Promise<void> {
   // Ensure parent dir exists for first-run scaffold.
   await fs.mkdir(path.dirname(statePath), { recursive: true });
   // Unique tmp name per call: parallel writers in one process must not share a tmp file.
@@ -165,11 +233,18 @@ export async function saveGoalState(statePath: string, state: GoalState): Promis
  * Try to acquire the claim lock file with exclusive create (atomic on POSIX).
  * Stale locks older than ttlMs are reclaimed so a crashed run cannot hold the loop forever.
  */
-async function acquireClaimLock(lockPath: string, owner: string, ttlMs: number, clock: Clock): Promise<boolean> {
+async function acquireClaimLock(
+  lockPath: string,
+  owner: string,
+  ttlMs: number,
+  clock: Clock,
+): Promise<boolean> {
   const now = clock.nowMs();
   try {
     // wx flag fails with EEXIST when another run holds the lock: atomic mutex.
-    await fs.writeFile(lockPath, JSON.stringify({ owner, at: now }), { flag: 'wx' });
+    await fs.writeFile(lockPath, JSON.stringify({ owner, at: now }), {
+      flag: 'wx',
+    });
     return true;
   } catch (err: unknown) {
     const code = (err as { code?: string }).code;
@@ -180,7 +255,9 @@ async function acquireClaimLock(lockPath: string, owner: string, ttlMs: number, 
       const parsed = JSON.parse(raw) as { at?: unknown };
       if (typeof parsed.at === 'number' && now - parsed.at > ttlMs) {
         await fs.unlink(lockPath);
-        await fs.writeFile(lockPath, JSON.stringify({ owner, at: now }), { flag: 'wx' });
+        await fs.writeFile(lockPath, JSON.stringify({ owner, at: now }), {
+          flag: 'wx',
+        });
         return true;
       }
     } catch {
@@ -201,7 +278,7 @@ export async function tryClaimLease(
   statePath: string,
   owner: string,
   ttlMs: number,
-  clock: Clock
+  clock: Clock,
 ): Promise<{ claimed: boolean; state: GoalState | null }> {
   // Short-lived lock file serializes parallel claimants in and across processes.
   const lockPath = statePath + '.lock';
@@ -216,7 +293,10 @@ export async function tryClaimLease(
     const current = await loadGoalState(statePath);
     const now = clock.nowMs();
     if (current !== null) {
-      const held = current.leaseOwner !== null && current.leaseExpiresAtMs > now && current.leaseOwner !== owner;
+      const held =
+        current.leaseOwner !== null &&
+        current.leaseExpiresAtMs > now &&
+        current.leaseOwner !== owner;
       if (held) {
         return { claimed: false, state: current };
       }
@@ -228,7 +308,7 @@ export async function tryClaimLease(
       ...current,
       leaseOwner: owner,
       leaseExpiresAtMs: now + ttlMs,
-      updatedAtMs: now
+      updatedAtMs: now,
     };
     await saveGoalState(statePath, next);
     return { claimed: true, state: next };
@@ -248,7 +328,11 @@ export async function tryClaimLease(
  * @param owner owner id to release
  * @param clock injected clock
  */
-export async function releaseLease(statePath: string, owner: string, clock: Clock): Promise<void> {
+export async function releaseLease(
+  statePath: string,
+  owner: string,
+  clock: Clock,
+): Promise<void> {
   const current = await loadGoalState(statePath);
   if (current === null) return;
   // Only owner can release, prevents clearing another run's lease.
@@ -257,7 +341,7 @@ export async function releaseLease(statePath: string, owner: string, clock: Cloc
     ...current,
     leaseOwner: null,
     leaseExpiresAtMs: 0,
-    updatedAtMs: clock.nowMs()
+    updatedAtMs: clock.nowMs(),
   };
   await saveGoalState(statePath, next);
 }
