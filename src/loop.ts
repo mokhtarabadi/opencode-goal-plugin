@@ -5,24 +5,51 @@
  */
 import { LEASE_TTL_MS, resolveStatePath } from './state.js';
 import type { Clock, GoalState } from './state.js';
-import { checkBudget } from './limits.js';
+import {
+  checkBudget,
+  checkPerSessionCooldown,
+  recordPerSessionTick,
+  _resetPerSessionCooldownForTests,
+} from './limits.js';
 import type { Limits } from './limits.js';
 
 /** In-process reentry guard for parallel idle ticks. */
 let idleInFlight = false;
 
 /**
+ * Per-project token guard so distinct sessions do not block each other
+ * while the same project still sends exactly once per tick.
+ * Why this map exists: global boolean alone serializes all sessions;
+ * token map keyed by projectDir gives per-session fairness while the
+ * global flag preserves the legacy single-flight proof. Token values
+ * prevent a stale finally from clearing a successor's guard.
+ */
+const activeContinueTokens = new Map<string, string>();
+
+/** Module token counter for unique per-tick owners without Clock. */
+let continueTokenCounter = 0;
+
+/**
  * Read guard for diagnostics.
+ * Returns true when any guard is held: legacy flag or token map.
  */
 export function isIdleInFlight(): boolean {
-  return idleInFlight;
+  // Either guard held means a turn is in flight somewhere.
+  return idleInFlight || activeContinueTokens.size > 0;
 }
 
 /**
  * Reset guard for tests only.
+ * Clears both legacy flag and per-project tokens plus per-session cooldown.
  */
 export function _resetIdleInFlightForTests(): void {
   idleInFlight = false;
+  activeContinueTokens.clear();
+  try {
+    _resetPerSessionCooldownForTests();
+  } catch {
+    // Reset is best-effort in mixed-version test bundles.
+  }
 }
 
 /** Idle tick context supplied by the host wiring. */
@@ -31,6 +58,13 @@ export interface IdleContext {
   projectDir: string;
   /** Last observed session message id, null when unknown. */
   lastMessageId: string | null;
+  /**
+   * Session id threading per-session fairness.
+   * Why optional exists: older callers pass projectDir only. When present,
+   * token plus cooldown keys become projectDir plus sessionId so distinct
+   * sessions in one project proceed independently.
+   */
+  sessionId?: string | null;
 }
 
 /** Injected collaborators so tests never touch disk or model. */
@@ -226,6 +260,27 @@ export async function handleSessionIdle(
   if (typeof deps.ownerId !== 'string' || deps.ownerId.length === 0) {
     return { decision: 'stopped', reason: 'invalid-owner' };
   }
+  // Token-guarded single-flight: per-session token plus legacy global flag.
+  // Why composite key exists: projectDir alone serializes all sessions in one
+  // project. Appending sessionId gives per-session fairness while global caps
+  // plus file lease still bound total cost. Missing sessionId falls back to
+  // projectDir alone for backwards compatibility with older callers.
+  const sessionPart =
+    typeof ctx.sessionId === 'string' && ctx.sessionId.length > 0
+      ? ctx.sessionId
+      : 'default';
+  const tokenKey = ctx.projectDir + ':' + sessionPart;
+  // Bound token map: evict oldest when over 500 lanes to avoid unbounded growth.
+  if (activeContinueTokens.size > 500) {
+    const oldest = activeContinueTokens.keys().next();
+    if (!oldest.done) activeContinueTokens.delete(oldest.value);
+  }
+  if (activeContinueTokens.has(tokenKey)) {
+    return { decision: 'skipped', reason: 'idle-inflight' };
+  }
+  continueTokenCounter += 1;
+  const myToken = deps.ownerId + ':' + String(continueTokenCounter);
+  activeContinueTokens.set(tokenKey, myToken);
   idleInFlight = true;
   try {
     const statePath = resolveStatePath(ctx.projectDir);
@@ -258,10 +313,39 @@ export async function handleSessionIdle(
         gate.reason === 'max-turns' ||
         gate.reason === 'wall-time' ||
         gate.reason === 'stop-file';
+      // Wrap-up-once bookkeeping: first budget hit flips wrapupSent true.
+      // Why save here exists: exactly one final marker survives restarts.
+      // Second hit becomes no-op without extra writes. Best-effort only.
+      if (
+        (gate.reason === 'max-turns' || gate.reason === 'wall-time') &&
+        current !== null &&
+        (current as GoalState).wrapupSent !== true
+      ) {
+        try {
+          await deps.saveState(statePath, {
+            ...(current as GoalState),
+            wrapupSent: true,
+            updatedAtMs: now,
+          });
+        } catch {
+          // Bookkeeping failure never changes the terminal verdict.
+        }
+      }
       return {
         decision: terminal ? 'stopped' : 'skipped',
         reason: gate.reason,
       };
+    }
+    // Per-session cooldown: same session firing too fast skips only this lane.
+    // Why composite key exists: projectDir alone blocks distinct sessions.
+    // Session-scoped key preserves fairness while global budgets still cap cost.
+    const perSession = checkPerSessionCooldown(
+      tokenKey,
+      now,
+      deps.limits.minDelayMs,
+    );
+    if (!perSession.ok) {
+      return { decision: 'skipped', reason: perSession.reason };
     }
     let claimed: { claimed: boolean; state: GoalState | null };
     try {
@@ -332,8 +416,22 @@ export async function handleSessionIdle(
     } catch {
       return { decision: 'stopped', reason: 'save-failed' };
     }
+    // Record per-session tick so this lane cools down independently.
+    try {
+      recordPerSessionTick(tokenKey, afterSend);
+    } catch {
+      // Cooldown bookkeeping never blocks a successful send.
+    }
     return { decision: 'sent', reason: 'ok', messageId: sent.messageId };
   } finally {
+    // Release only our own token: a successor's guard must survive our exit.
+    try {
+      if (activeContinueTokens.get(tokenKey) === myToken) {
+        activeContinueTokens.delete(tokenKey);
+      }
+    } catch {
+      // Token cleanup is best-effort; lease TTL reclaims anyway.
+    }
     idleInFlight = false;
   }
 }

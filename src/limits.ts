@@ -26,6 +26,59 @@ export const DEFAULT_LIMITS: Limits = {
 export const STOP_FILE_NAME = 'STOP_GOAL';
 
 /**
+ * Per-session last-tick map for fair cooldown.
+ * Why this map exists: global minDelayMs alone throttles all sessions
+ * together. Per-session entries keyed by composite projectDir plus sessionId
+ * preserve responsiveness while global maxTurns plus maxWallMs still cap
+ * total cost. Clock-driven only, no Date.now here. Test-only reset keeps
+ * suites isolated.
+ */
+const perSessionLastTick = new Map<string, number>();
+
+/**
+ * Clear per-session cooldown state for tests only.
+ */
+export function _resetPerSessionCooldownForTests(): void {
+  perSessionLastTick.clear();
+}
+
+/**
+ * Check per-session cooldown without touching global budgets.
+ * Returns ok false with reason cooldown when this session fired too recently.
+ * @param sessionKey projectDir or session id isolating one lane
+ * @param nowMs injected now in epoch ms
+ * @param minDelayMs minimum gap from DEFAULT_LIMITS
+ */
+export function checkPerSessionCooldown(
+  sessionKey: string,
+  nowMs: number,
+  minDelayMs: number,
+): { ok: boolean; reason: string } {
+  // Missing key means first turn: always pass so goals start promptly.
+  const last = perSessionLastTick.get(sessionKey);
+  if (last === undefined) return { ok: true, reason: 'ok' };
+  // Fresh tick inside the window blocks only this session, not others.
+  if (nowMs - last < minDelayMs) return { ok: false, reason: 'cooldown' };
+  return { ok: true, reason: 'ok' };
+}
+
+/**
+ * Record a successful per-session tick with injected time.
+ * Evicts oldest when over 500 lanes to avoid unbounded growth.
+ * @param sessionKey projectDir plus session id composite isolating one lane
+ * @param nowMs injected now in epoch ms
+ */
+export function recordPerSessionTick(sessionKey: string, nowMs: number): void {
+  // Cap at 500 lanes: oldest entry evicted first, keeps memory bounded.
+  if (perSessionLastTick.size >= 500 && !perSessionLastTick.has(sessionKey)) {
+    const oldest = perSessionLastTick.keys().next();
+    if (!oldest.done) perSessionLastTick.delete(oldest.value);
+  }
+  // Overwrite keeps one entry per lane: bounded by session count.
+  perSessionLastTick.set(sessionKey, nowMs);
+}
+
+/**
  * Check turn and wall budgets.
  * @param state current goal state
  * @param nowMs injected now in epoch ms

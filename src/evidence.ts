@@ -118,7 +118,9 @@ export async function loadEvidence(
 }
 
 /**
- * Save evidence sidecar atomically via tmp plus rename.
+ * Save evidence sidecar atomically via tmp plus rename with durability.
+ * Why hardening exists: evidence is the second leg of completion proof.
+ * Fsync plus chmod mirrors state durability so a crash cannot hollow proof.
  * @param projectDir absolute project root
  * @param ev evidence to persist
  */
@@ -133,5 +135,26 @@ export async function saveEvidence(
   const tmp =
     target + '.tmp-' + String(process.pid) + '-' + String(evidenceTmpCounter);
   await fs.writeFile(tmp, JSON.stringify(ev, null, 2), 'utf8');
+  try {
+    // Harden payload before publish; best-effort on exotic FS.
+    const fh = await fs.open(tmp, 'r');
+    try {
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+  } catch {
+    // Fsync unavailable: rename atomicity still holds.
+  }
+  try {
+    await fs.chmod(tmp, 0o600);
+  } catch {
+    // Non-POSIX: optional hardening only.
+  }
   await fs.rename(tmp, target);
+  try {
+    await fs.chmod(target, 0o600);
+  } catch {
+    // Optional hardening only.
+  }
 }

@@ -59,6 +59,61 @@ export async function snapshotForCompaction(
 }
 
 /**
+ * Build a short evidence nudge for context injection.
+ * Why this helper exists: goal-loop pattern shows bare completions need
+ * targeted correction text re-injected each turn. Pure so tests never touch disk.
+ * @param objective active objective text
+ * @param pendingVerification true when verifier is still running
+ */
+export function buildEvidenceNudge(
+  objective: string,
+  pendingVerification: boolean,
+): string {
+  // Null guard plus truncate: long objectives must not bloat every model request.
+  // Non-string input still returns a non-empty nudge, never throws into hooks.
+  const raw = typeof objective === 'string' ? objective : '';
+  const clean =
+    raw.trim().length > 0 ? raw.trim().slice(0, 500) : 'active goal';
+  // Keep one line, non-empty always: context hook appends it verbatim.
+  const base =
+    'Evidence required to complete "' +
+    clean +
+    '": cite files plus passing tests.';
+  // Pending flag adds pause wording without stopping the goal.
+  if (pendingVerification === true) {
+    return base + ' Verification pending, hold auto turns until proof lands.';
+  }
+  return (
+    base + ' Call /goal complete only with proof, or /goal block <reason>.'
+  );
+}
+
+/**
+ * Prune stale idle controllers while keeping the live subscriber.
+ * Why this helper exists: compaction must clear dead listeners without
+ * killing auto-continue. Copy-iterate avoids skip-during-delete fragility
+ * when a Set is mutated during iteration. Pure and sync for testability.
+ * @param controllers tracked abort controllers
+ * @param live active controller that must survive
+ */
+export function pruneIdleControllers(
+  controllers: Set<{ abort: () => void }>,
+  live: { abort: () => void },
+): void {
+  // Copy first: deleting during direct Set iteration can skip entries.
+  for (const c of [...controllers]) {
+    if (c === live) continue;
+    try {
+      c.abort();
+    } catch {
+      // One bad abort never blocks compaction.
+    }
+    controllers.delete(c as never);
+  }
+  (controllers as Set<unknown>).add(live as unknown as never);
+}
+
+/**
  * Restore after compaction or resume: reload file state, bump restoreCount, keep cooldown.
  * Never claims a lease and never sends. Next idle tick decides.
  * @param statePath absolute goal state path

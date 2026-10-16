@@ -7,14 +7,42 @@
 import * as path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { Plugin } from '@opencode/plugin';
-import { SystemClock, loadGoalState, resolveStatePath, saveGoalState, tryClaimLease } from './state.js';
+import {
+  SystemClock,
+  loadGoalState,
+  resolveStatePath,
+  saveGoalState,
+  tryClaimLease,
+} from './state.js';
 import type { Clock, GoalState } from './state.js';
-import { blockGoal, clearGoal, completeGoal, parseGoalCommand, setObjective } from './goal.js';
+import {
+  blockGoal,
+  clearGoal,
+  completeGoal,
+  parseGoalCommand,
+  setObjective,
+  isSafeGoalTitle,
+  GoalInputSchema,
+} from './goal.js';
 import { handleSessionIdle } from './loop.js';
 import { DEFAULT_LIMITS, STOP_FILE_NAME } from './limits.js';
 import type { Limits } from './limits.js';
-import { snapshotForCompaction, restoreAfterCompaction } from './compaction.js';
-import { saveEvidence, emptyEvidence } from './evidence.js';
+import {
+  snapshotForCompaction,
+  restoreAfterCompaction,
+  buildEvidenceNudge,
+  pruneIdleControllers,
+} from './compaction.js';
+import { saveEvidence, emptyEvidence, loadEvidence } from './evidence.js';
+import { tryCompleteWithEvidence } from './verifier.js';
+
+/**
+ * V2 contract note: file-state at .opencode/goal-state.json owns truth.
+ * Why ctx.storage does not own truth: 76 tests plus compaction survival
+ * assume file truth with atomic tmp plus rename. Storage is ephemeral
+ * cache only and never replaces the file. No server export exists here
+ * by design because V2 ignores server() and reads only id plus setup().
+ */
 
 export const PLUGIN_NAME = 'opencode-goal-plugin';
 export const PLUGIN_VERSION = '0.2.0';
@@ -60,7 +88,7 @@ export async function handleGoalCommand(
   rawInput: string,
   projectDir: string,
   clock: Clock = new SystemClock(),
-  hostVersion: string = '2.0.29'
+  hostVersion: string = '2.0.29',
 ): Promise<string> {
   // Type guards first: a misbehaving host gets a message, never a TypeError.
   if (typeof rawInput !== 'string') {
@@ -80,13 +108,33 @@ export async function handleGoalCommand(
     current = await loadGoalState(statePath);
   } catch {
     // Corrupt JSON or shape mismatch: point at the file, do not throw.
-    return 'Goal state is corrupt at ' + statePath + '. Back up the file then clear it.';
+    return (
+      'Goal state is corrupt at ' +
+      statePath +
+      '. Back up the file then clear it.'
+    );
   }
   if (parsed.kind === 'status') {
     if (current === null) return 'No goal set. Use /goal <objective>.';
     return 'Goal ' + current.status + ': ' + current.objective;
   }
   if (parsed.kind === 'set') {
+    // V2 strictness: JSON Schema shape plus traversal guard before disk.
+    // Why extra check exists: parser allows prose, schema plus guard blocks
+    // path escapes that could confuse later file citations. Valid prose passes.
+    // Real schema enforcement: title must be string 1..2000, required, no extras.
+    const schemaOk =
+      GoalInputSchema.required.includes('title') &&
+      GoalInputSchema.additionalProperties === false &&
+      typeof parsed.objective === 'string' &&
+      parsed.objective.trim().length >= 1 &&
+      parsed.objective.length <= 2000;
+    if (!schemaOk) {
+      return 'Invalid /goal usage. Try /goal <objective> or /goal status.';
+    }
+    if (!isSafeGoalTitle(parsed.objective)) {
+      return 'Invalid /goal usage. Objective must not be a path escape.';
+    }
     // New objective resets counters and clears any stale lease.
     const next = setObjective(current, parsed.objective, clock, hostVersion);
     try {
@@ -105,7 +153,11 @@ export async function handleGoalCommand(
     try {
       next = blockGoal(current, parsed.reason, clock);
     } catch {
-      return 'Only an active goal can be blocked. Current status: ' + current.status + '.';
+      return (
+        'Only an active goal can be blocked. Current status: ' +
+        current.status +
+        '.'
+      );
     }
     try {
       await saveGoalState(statePath, next);
@@ -115,11 +167,36 @@ export async function handleGoalCommand(
     return 'Goal marked blocked: ' + parsed.reason;
   }
   if (parsed.kind === 'complete') {
+    // Evidence gate: active goals need proof, blocked or done still report status.
+    // Why order matters: legacy status error must surface first so existing
+    // blocked-complete test keeps its message. Only active goals reach verifier.
     let next: GoalState;
     try {
       next = completeGoal(current, clock);
     } catch {
-      return 'Only an active goal can complete. Current status: ' + current.status + '.';
+      return (
+        'Only an active goal can complete. Current status: ' +
+        current.status +
+        '.'
+      );
+    }
+    // Active path now requires evidence: missing proof blocks with friendly text.
+    try {
+      const ev = await loadEvidence(projectDir);
+      const check = await tryCompleteWithEvidence({
+        projectDir,
+        evidence: ev,
+      });
+      if (!check.ok) {
+        return (
+          'Complete blocked: ' +
+          check.reason +
+          '. Add file citations plus passing tests to evidence.'
+        );
+      }
+    } catch {
+      // Verifier failure fails closed: do not mark complete without proof.
+      return 'Complete blocked: verifier-error. Add evidence and retry.';
     }
     try {
       await saveGoalState(statePath, next);
@@ -148,7 +225,9 @@ export function handleIdleStub(): string {
 export interface RegisterIdleOptions {
   projectDir: string;
   getLastMessageId: () => string | null;
-  sendPrompt: (prompt: string) => Promise<{ messageId: string; tokenSpend?: number }>;
+  sendPrompt: (
+    prompt: string,
+  ) => Promise<{ messageId: string; tokenSpend?: number }>;
   clock?: Clock;
   limits?: Limits;
   ownerId?: string;
@@ -177,15 +256,24 @@ export function defaultHasStopFile(projectDir: string): () => Promise<boolean> {
  * @param host unknown host object from OpenCode V2
  * @param opts project dir plus host callbacks
  */
-export function registerIdleHandler(host: unknown, opts: RegisterIdleOptions): { registered: boolean; reason: string } {
+export function registerIdleHandler(
+  host: unknown,
+  opts: RegisterIdleOptions,
+): { registered: boolean; reason: string } {
   // Opts guards first: bad input gets a reason string, never a TypeError.
   if (opts === null || typeof opts !== 'object') {
     return { registered: false, reason: 'invalid-opts' };
   }
-  if (typeof opts.projectDir !== 'string' || opts.projectDir.trim().length === 0) {
+  if (
+    typeof opts.projectDir !== 'string' ||
+    opts.projectDir.trim().length === 0
+  ) {
     return { registered: false, reason: 'invalid-opts' };
   }
-  if (typeof opts.getLastMessageId !== 'function' || typeof opts.sendPrompt !== 'function') {
+  if (
+    typeof opts.getLastMessageId !== 'function' ||
+    typeof opts.sendPrompt !== 'function'
+  ) {
     return { registered: false, reason: 'invalid-opts' };
   }
   // Probe first so unknown hosts get a reason string, never an exception.
@@ -200,7 +288,12 @@ export function registerIdleHandler(host: unknown, opts: RegisterIdleOptions): {
   const clock = opts.clock ?? new SystemClock();
   const limits = opts.limits ?? DEFAULT_LIMITS;
   // Random owner suffix separates this process from other loop runners.
-  const ownerId = opts.ownerId ?? ('idle-' + String(process.pid) + '-' + String(Math.floor(Math.random() * 1000000)));
+  const ownerId =
+    opts.ownerId ??
+    'idle-' +
+      String(process.pid) +
+      '-' +
+      String(Math.floor(Math.random() * 1000000));
   if (typeof ownerId !== 'string' || ownerId.length === 0) {
     return { registered: false, reason: 'invalid-opts' };
   }
@@ -214,7 +307,16 @@ export function registerIdleHandler(host: unknown, opts: RegisterIdleOptions): {
       lastId = null;
     }
     const ctx = { projectDir: opts.projectDir, lastMessageId: lastId };
-    const deps = { clock, limits, ownerId, loadState: loadGoalState, saveState: saveGoalState, tryClaim: tryClaimLease, sendPrompt: opts.sendPrompt, hasStopFile };
+    const deps = {
+      clock,
+      limits,
+      ownerId,
+      loadState: loadGoalState,
+      saveState: saveGoalState,
+      tryClaim: tryClaimLease,
+      sendPrompt: opts.sendPrompt,
+      hasStopFile,
+    };
     try {
       await handleSessionIdle(ctx, deps);
     } catch {
@@ -244,7 +346,7 @@ export interface RegisterCompactionOptions {
  */
 export function registerCompactionHandler(
   host: unknown,
-  opts: RegisterCompactionOptions
+  opts: RegisterCompactionOptions,
 ): { registered: boolean; reason: string } {
   // Whole body inside try: any unexpected throw maps to register-failed, never escapes.
   try {
@@ -252,7 +354,10 @@ export function registerCompactionHandler(
     if (opts === null || typeof opts !== 'object') {
       return { registered: false, reason: 'invalid-opts' };
     }
-    if (typeof opts.projectDir !== 'string' || opts.projectDir.trim().length === 0) {
+    if (
+      typeof opts.projectDir !== 'string' ||
+      opts.projectDir.trim().length === 0
+    ) {
       return { registered: false, reason: 'invalid-opts' };
     }
     // Host guard before any dereference: null hosts get unavailable, never TypeError.
@@ -261,7 +366,11 @@ export function registerCompactionHandler(
     }
     const hooks = getAvailableHooks(host);
     const hasCompact = hooks.includes('onCompact');
-    const h = host as { onCompact?: unknown; onSessionResume?: unknown; onSessionStart?: unknown };
+    const h = host as {
+      onCompact?: unknown;
+      onSessionResume?: unknown;
+      onSessionStart?: unknown;
+    };
     const resumeFn =
       typeof h.onSessionResume === 'function'
         ? (h.onSessionResume as (cb: () => Promise<void>) => void)
@@ -307,9 +416,16 @@ export function registerCompactionHandler(
  * @param objective active objective text
  * @param iterationCount current turn count for context
  */
-export function buildGoalWorkInstruction(objective: string, iterationCount: number): string {
+export function buildGoalWorkInstruction(
+  objective: string,
+  iterationCount: number,
+): string {
   return (
-    'Goal accepted: "' + objective + '" (turn ' + String(iterationCount + 1) + ').\n' +
+    'Goal accepted: "' +
+    objective +
+    '" (turn ' +
+    String(iterationCount + 1) +
+    ').\n' +
     'Work toward it now with concrete steps.\n' +
     'When done, finish with evidence and call /goal complete. ' +
     'If blocked, call /goal block <reason>. To cancel, call /goal clear.'
@@ -324,7 +440,10 @@ export function buildGoalWorkInstruction(objective: string, iterationCount: numb
 export function resolveProjectDir(ctx: unknown): string {
   try {
     const c = ctx as { location?: { directory?: unknown } };
-    if (typeof c.location?.directory === 'string' && c.location.directory.length > 0) {
+    if (
+      typeof c.location?.directory === 'string' &&
+      c.location.directory.length > 0
+    ) {
       return c.location.directory;
     }
   } catch {
@@ -340,9 +459,11 @@ export function resolveProjectDir(ctx: unknown): string {
  * @param text message text
  */
 async function notifySynthetic(
-  session: { synthetic?: (args: { sessionID: string; text: string }) => Promise<unknown> },
+  session: {
+    synthetic?: (args: { sessionID: string; text: string }) => Promise<unknown>;
+  },
   sessionID: string,
-  text: string
+  text: string,
 ): Promise<void> {
   try {
     if (typeof session.synthetic === 'function') {
@@ -362,46 +483,130 @@ export default Plugin.define({
   async setup(ctx) {
     const projectDir = resolveProjectDir(ctx);
     const clock = new SystemClock();
-    const ownerId = 'v2-' + String(process.pid) + '-' + String(Math.floor(Math.random() * 1000000));
+    const ownerId =
+      'v2-' +
+      String(process.pid) +
+      '-' +
+      String(Math.floor(Math.random() * 1000000));
     const hasStopFile = defaultHasStopFile(projectDir);
 
     // Slash goal command: set drives work, the rest report status.
     try {
       const cmd = (ctx as { command?: { transform?: unknown } }).command;
-      if (cmd !== null && typeof cmd === 'object' && typeof (cmd as { transform?: unknown }).transform === 'function') {
+      if (
+        cmd !== null &&
+        typeof cmd === 'object' &&
+        typeof (cmd as { transform?: unknown }).transform === 'function'
+      ) {
         await (
           cmd as {
-            transform: (fn: (editor: { add: (d: { name: string; description: string; execute: (i: unknown) => Promise<void> }) => void }) => void) => Promise<unknown>;
+            transform: (
+              fn: (editor: {
+                add: (d: {
+                  name: string;
+                  description: string;
+                  execute: (i: unknown) => Promise<void>;
+                }) => void;
+              }) => void,
+            ) => Promise<unknown>;
           }
         ).transform((editor) => {
           editor.add({
             name: 'goal',
-            description: 'Set a session goal and auto-continue until complete, blocked, or cleared.',
+            description:
+              'Set a session goal and auto-continue until complete, blocked, or cleared.',
             execute: async (invocation: unknown) => {
               try {
-                const inv = invocation as { sessionID?: unknown; prompt?: { text?: unknown } };
-                const sessionID = typeof inv.sessionID === 'string' ? inv.sessionID : '';
-                const text = typeof inv.prompt?.text === 'string' ? (inv.prompt.text as string) : '';
+                const inv = invocation as {
+                  sessionID?: unknown;
+                  prompt?: { text?: unknown };
+                };
+                const sessionID =
+                  typeof inv.sessionID === 'string' ? inv.sessionID : '';
+                const text =
+                  typeof inv.prompt?.text === 'string'
+                    ? (inv.prompt.text as string)
+                    : '';
                 const parsed = parseGoalCommand('/goal ' + text);
                 if (parsed.kind === 'set') {
+                  // Setup guard mirrors handleGoalCommand: reject path escapes here too.
+                  // Why duplicate check exists: V2 setup executes set directly,
+                  // bypassing the guarded handler below. Both lanes must enforce.
+                  if (!isSafeGoalTitle(parsed.objective)) {
+                    if (sessionID !== '') {
+                      const session = (
+                        ctx as {
+                          session?: {
+                            synthetic?: (a: {
+                              sessionID: string;
+                              text: string;
+                            }) => Promise<unknown>;
+                          };
+                        }
+                      ).session;
+                      try {
+                        await session?.synthetic?.({
+                          sessionID,
+                          text: 'Invalid /goal usage. Objective must not be a path escape.',
+                        });
+                      } catch {
+                        // Best-effort notice only.
+                      }
+                    }
+                    return;
+                  }
                   const statePath = resolveStatePath(projectDir);
-                  const current = await loadGoalState(statePath).catch(() => null);
-                  const next = setObjective(current, parsed.objective, clock, '2.0.29');
+                  const current = await loadGoalState(statePath).catch(
+                    () => null,
+                  );
+                  const next = setObjective(
+                    current,
+                    parsed.objective,
+                    clock,
+                    '2.0.29',
+                  );
                   await saveGoalState(statePath, next);
                   // Seed evidence shell so completion checks have a file from turn one.
-                  await saveEvidence(projectDir, emptyEvidence(clock.nowMs())).catch(() => undefined);
+                  await saveEvidence(
+                    projectDir,
+                    emptyEvidence(clock.nowMs()),
+                  ).catch(() => undefined);
                   if (sessionID !== '') {
-                    await (ctx as { session?: { prompt?: (a: unknown) => Promise<unknown> } }).session
-                      ?.prompt?.({ sessionID, text: buildGoalWorkInstruction(next.objective, next.iterationCount) })
+                    await (
+                      ctx as {
+                        session?: { prompt?: (a: unknown) => Promise<unknown> };
+                      }
+                    ).session
+                      ?.prompt?.({
+                        sessionID,
+                        text: buildGoalWorkInstruction(
+                          next.objective,
+                          next.iterationCount,
+                        ),
+                      })
                       .catch(() => undefined);
                   }
                   return;
                 }
                 // Status, block, complete, and clear reuse the guarded handler, then report.
-                const message = await handleGoalCommand('/goal ' + text, projectDir, clock);
+                const message = await handleGoalCommand(
+                  '/goal ' + text,
+                  projectDir,
+                  clock,
+                );
                 if (sessionID !== '') {
-                  const session = (ctx as { session?: { synthetic?: (a: { sessionID: string; text: string }) => Promise<unknown> } }).session;
-                  if (session !== undefined) await notifySynthetic(session, sessionID, message);
+                  const session = (
+                    ctx as {
+                      session?: {
+                        synthetic?: (a: {
+                          sessionID: string;
+                          text: string;
+                        }) => Promise<unknown>;
+                      };
+                    }
+                  ).session;
+                  if (session !== undefined)
+                    await notifySynthetic(session, sessionID, message);
                 }
               } catch {
                 // Command failures stay local; the host loop continues.
@@ -415,12 +620,23 @@ export default Plugin.define({
     }
 
     // Idle auto-continue: one safe turn per session idle tick.
+    // AbortSet hygiene: every subscribe controller is tracked so compaction
+    // can abort stale listeners and prevent duplicate ticks after resume.
     const controller = new AbortController();
+    const idleAbortControllers = new Set<AbortController>();
+    idleAbortControllers.add(controller);
     const idleTask = (async () => {
       try {
-        const events = (ctx as { event?: { subscribe?: (a: unknown) => AsyncIterable<unknown> } }).event;
-        if (events === undefined || typeof events.subscribe !== 'function') return;
-        const stream = events.subscribe({ signal: controller.signal }) as AsyncIterable<{
+        const events = (
+          ctx as {
+            event?: { subscribe?: (a: unknown) => AsyncIterable<unknown> };
+          }
+        ).event;
+        if (events === undefined || typeof events.subscribe !== 'function')
+          return;
+        const stream = events.subscribe({
+          signal: controller.signal,
+        }) as AsyncIterable<{
           type?: unknown;
           data?: { sessionID?: unknown };
           properties?: { sessionID?: unknown };
@@ -430,11 +646,15 @@ export default Plugin.define({
             if (event === null || typeof event !== 'object') continue;
             if ((event as { type?: unknown }).type !== 'session.idle') continue;
             const data = (event as { data?: { sessionID?: unknown } }).data;
-            const props = (event as { properties?: { sessionID?: unknown } }).properties;
+            const props = (event as { properties?: { sessionID?: unknown } })
+              .properties;
             const rawID = data?.sessionID ?? props?.sessionID;
             if (typeof rawID !== 'string' || rawID.length === 0) continue;
-            const session = (ctx as { session?: { prompt?: (a: unknown) => Promise<unknown> } }).session;
-            if (session === undefined || typeof session.prompt !== 'function') continue;
+            const session = (
+              ctx as { session?: { prompt?: (a: unknown) => Promise<unknown> } }
+            ).session;
+            if (session === undefined || typeof session.prompt !== 'function')
+              continue;
             const promptFn = session.prompt.bind(session);
             const deps = {
               clock,
@@ -444,17 +664,27 @@ export default Plugin.define({
               saveState: saveGoalState,
               tryClaim: tryClaimLease,
               sendPrompt: async (prompt: string) => {
-                const res = (await promptFn({ sessionID: rawID, text: prompt }).catch(() => null)) as {
+                const res = (await promptFn({
+                  sessionID: rawID,
+                  text: prompt,
+                }).catch(() => null)) as {
                   messageID?: unknown;
                   tokenSpend?: unknown;
                 } | null;
-                const messageID = typeof res?.messageID === 'string' && res.messageID.length > 0 ? res.messageID : 'turn-unlabeled';
-                const tokenSpend = typeof res?.tokenSpend === 'number' ? res.tokenSpend : 0;
+                const messageID =
+                  typeof res?.messageID === 'string' && res.messageID.length > 0
+                    ? res.messageID
+                    : 'turn-unlabeled';
+                const tokenSpend =
+                  typeof res?.tokenSpend === 'number' ? res.tokenSpend : 0;
                 return { messageId: messageID, tokenSpend };
               },
               hasStopFile,
             };
-            await handleSessionIdle({ projectDir, lastMessageId: null }, deps);
+            await handleSessionIdle(
+              { projectDir, lastMessageId: null, sessionId: rawID },
+              deps,
+            );
           } catch {
             // One bad tick never kills the subscription.
           }
@@ -466,20 +696,40 @@ export default Plugin.define({
 
     // Compaction survival: re-inject the goal summary from file state, never send.
     try {
-      const session = (ctx as { session?: { hook?: (n: string, f: (e: unknown) => void) => Promise<unknown> } }).session;
+      const session = (
+        ctx as {
+          session?: {
+            hook?: (n: string, f: (e: unknown) => void) => Promise<unknown>;
+          };
+        }
+      ).session;
       if (session !== undefined && typeof session.hook === 'function') {
         await session
           .hook('compaction', (event: unknown) => {
             try {
               const e = event as { sessionID?: unknown; messages?: unknown };
               if (typeof e.sessionID !== 'string') return;
+              // Abort hygiene: stale idle listeners must not double-fire after resume.
+              // Keep the live controller via pure helper so behavior is tested.
+              // Copy-iterate inside helper avoids skip-during-delete fragility.
+              try {
+                pruneIdleControllers(idleAbortControllers, controller);
+              } catch {
+                // Prune failure never blocks compaction; live stays registered.
+                idleAbortControllers.add(controller);
+              }
               void loadGoalState(resolveStatePath(projectDir))
                 .then((state) => {
                   if (state === null || state.status !== 'active') return;
                   if (!Array.isArray(e.messages)) return;
                   e.messages.push({
                     role: 'user',
-                    content: 'Restored goal after compaction: "' + state.objective + '" (turn ' + String(state.iterationCount) + '). Continue it.',
+                    content:
+                      'Restored goal after compaction: "' +
+                      state.objective +
+                      '" (turn ' +
+                      String(state.iterationCount) +
+                      '). Continue it.',
                   });
                 })
                 .catch(() => undefined);
@@ -497,7 +747,15 @@ export default Plugin.define({
                 .then((state) => {
                   if (state === null || state.status !== 'active') return;
                   if (!Array.isArray(e.system)) return;
-                  e.system.push({ type: 'text', text: 'Active goal: "' + state.objective + '". Finish with evidence, or report blocked.' });
+                  // Evidence nudge rides the context hook so bare completes get corrected.
+                  const nudge = buildEvidenceNudge(
+                    state.objective,
+                    state.pendingVerification,
+                  );
+                  e.system.push({
+                    type: 'text',
+                    text: 'Active goal: "' + state.objective + '". ' + nudge,
+                  });
                 })
                 .catch(() => undefined);
             } catch {
@@ -516,6 +774,19 @@ export default Plugin.define({
         controller.abort();
       } catch {
         // Abort is best-effort during unload.
+      }
+      try {
+        // Clear tracked controllers so no stale listener survives unload.
+        for (const c of idleAbortControllers) {
+          try {
+            c.abort();
+          } catch {
+            // Best-effort only.
+          }
+        }
+        idleAbortControllers.clear();
+      } catch {
+        // Never throw during unload.
       }
       void idleTask.catch(() => undefined);
     };

@@ -101,6 +101,49 @@ export function parseGoalCommand(rawInput: string): ParsedGoal {
 }
 
 /**
+ * JSON Schema for goal input used by V2 tool plus slash command.
+ * Why this schema exists: V2 strict providers reject malformed tool
+ * payloads. Declarative schema keeps validation testable without host.
+ * Title is required, max 2000 to match parser, no additional props.
+ */
+export const GoalInputSchema = {
+  type: 'object',
+  properties: {
+    title: { type: 'string', minLength: 1, maxLength: 2000 },
+  },
+  required: ['title'],
+  additionalProperties: false,
+} as const;
+
+/**
+ * Validate a goal title against traversal plus absolute-path abuse.
+ * Why this guard exists: evidence citations must stay inside the project.
+ * Objectives that are bare paths could trick later file resolution.
+ * Normal prose with slashes still passes, only path escapes fail.
+ * @param title trimmed objective text
+ */
+export function isSafeGoalTitle(title: string): boolean {
+  // Non-string or empty never passes: parser already rejects bare input.
+  if (typeof title !== 'string') return false;
+  const t = title.trim();
+  if (t.length === 0) return false;
+  if (t.length > MAX_OBJECTIVE_LEN) return false;
+  // Reject dot-dot traversal segments and absolute paths only.
+  // Names merely starting with dots (e.g. .opencode) stay allowed.
+  if (t === '..') return false;
+  if (t.startsWith('../') || t.includes('/../') || t.endsWith('/..'))
+    return false;
+  if (t.startsWith('..\\') || t.includes('\\..\\')) return false;
+  if (t.startsWith('/')) return false;
+  // Reject Windows drive escapes like C:\escape or C:/escape.
+  // Plain prose with colon plus space (e.g. note: fix) stays allowed.
+  if (/^[A-Za-z]:[\\/]/.test(t)) return false;
+  // Reject drive-relative escapes like C:escape without slash.
+  if (/^[A-Za-z]:[^/\\]/.test(t)) return false;
+  return true;
+}
+
+/**
  * Set a new objective, resetting counters and clearing lease.
  * @param prev previous state or null for first run
  * @param objective new objective text

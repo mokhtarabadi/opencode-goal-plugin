@@ -6,9 +6,17 @@ All notable changes follow Keep a Changelog.
 - Subagent dispatch tests for pass, fail, and throw paths.
 - MIT LICENSE plus install docs for all four surfaces.
 - Version note: package stays 0.2.0 during Night Work and sync to 0.3.0 is gated to morning publish with token plus live matrix.
+- Durable atomic write with fsync plus chmod 0600 plus dir sync plus corrupt quarantine.
+- Fail-closed lease with token single-flight plus per-session cooldown fairness.
+- Evidence-gated complete helper plus wrap-up flag plus context nudge injection.
+- V2 strictness with goal input JSON Schema plus traversal-safe title check.
 ### Fixed
 - Host-native V2 export: default is Plugin.define with id plus setup wiring slash goal plus idle plus compaction.
 - ESM-only dist because the plugin package ships no require entry.
+- Hotfix idle survival: compaction keeps live controller, stale entries cleared.
+- Hotfix evidence wiring: both complete lanes require proof plus wrapupSent once.
+- Hotfix setup guard plus session fairness plus lease proof with sidecar.
+- Hotfix2 afterSend Clock plus Set copy plus prune helper plus drive-relative guard.
 ## [0.3.0] - 2026-10-16
 ### Added
 - Compaction snapshot plus restore with restoreCount audit and cooldown clamp.

@@ -15,7 +15,10 @@ import { validateEvidenceShape, hashEvidence } from './evidence.js';
  * @param projectDir absolute project root
  * @param citation cited path, relative or absolute
  */
-export function isCitationInsideProjectDir(projectDir: string, citation: string): boolean {
+export function isCitationInsideProjectDir(
+  projectDir: string,
+  citation: string,
+): boolean {
   try {
     // Non-string JSON values fail closed instead of throwing in path calls.
     if (typeof citation !== 'string') {
@@ -33,7 +36,11 @@ export function isCitationInsideProjectDir(projectDir: string, citation: string)
       return false;
     }
     // Exact parent segments only: names merely starting with two dots stay inside.
-    if (rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel)) {
+    if (
+      rel === '..' ||
+      rel.startsWith('..' + path.sep) ||
+      path.isAbsolute(rel)
+    ) {
       return false;
     }
     return true;
@@ -161,4 +168,28 @@ export async function verifyCompletion(args: {
       failures: ['verifier threw'],
     };
   }
+}
+
+/**
+ * Evidence-gated completion check for the complete path.
+ * Why this helper exists: goal-loop evidence discipline blocks bare
+ * self-report completes while keeping the legacy pure completeGoal intact
+ * for backwards compatibility. Returns pass only when local verifier ok.
+ * Wrap-up-once is tracked via state.wrapupSent by callers, not here.
+ * @param args project dir plus evidence plus optional host dispatch
+ */
+export async function tryCompleteWithEvidence(args: {
+  projectDir: string;
+  evidence: GoalEvidenceFile | null;
+  host?: unknown;
+  useSubagent?: boolean;
+  stateSummary?: string;
+}): Promise<LocalVerifyResult> {
+  // Delegate to full verifier: local first, optional subagent second.
+  const got = await verifyCompletion(args);
+  // Map missing proof to explicit gate reason for friendly UI messages.
+  if (!got.ok && got.reason === 'missing-evidence') {
+    return { ok: false, reason: 'evidence-required', failures: got.failures };
+  }
+  return got;
 }
