@@ -21,6 +21,13 @@ interface Limits {
     maxWallMs: number;
 }
 
+/**
+ * V2 contract note: file-state at .opencode/goal-state.json owns truth.
+ * Why ctx.storage does not own truth: 76 tests plus compaction survival
+ * assume file truth with atomic tmp plus rename. Storage is ephemeral
+ * cache only and never replaces the file. No server export exists here
+ * by design because V2 ignores server() and reads only id plus setup().
+ */
 declare const PLUGIN_NAME = "opencode-goal-plugin";
 declare const PLUGIN_VERSION = "0.2.0";
 /** Minimal host shape, all fields optional so probing never throws. */

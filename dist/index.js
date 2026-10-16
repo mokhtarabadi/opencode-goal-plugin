@@ -1,6 +1,6 @@
 // src/index.ts
-import * as path3 from "path";
-import { promises as fs3 } from "fs";
+import * as path4 from "path";
+import { promises as fs4 } from "fs";
 import { Plugin } from "@opencode/plugin";
 
 // src/state.ts
@@ -41,7 +41,8 @@ function initialState(objective, clock, hostVersion) {
     evidenceHash: null,
     pendingVerification: false,
     verificationFailReason: null,
-    revisionCount: 0
+    revisionCount: 0,
+    wrapupSent: false
   };
 }
 function isValidState(value) {
@@ -77,9 +78,11 @@ function isValidState(value) {
     return false;
   if ("revisionCount" in v && typeof v["revisionCount"] !== "number")
     return false;
+  if ("wrapupSent" in v && typeof v["wrapupSent"] !== "boolean") return false;
   return true;
 }
 function normalizeState(input) {
+  const wrap = input.wrapupSent;
   return {
     ...input,
     lastTurnAtMs: input.lastTurnAtMs ?? 0,
@@ -89,30 +92,88 @@ function normalizeState(input) {
     evidenceHash: input.evidenceHash ?? null,
     pendingVerification: input.pendingVerification ?? false,
     verificationFailReason: input.verificationFailReason ?? null,
-    revisionCount: input.revisionCount ?? 0
+    revisionCount: input.revisionCount ?? 0,
+    wrapupSent: typeof wrap === "boolean" ? wrap : false
   };
 }
 async function loadGoalState(statePath) {
+  let raw;
   try {
-    const raw = await fs.readFile(statePath, "utf8");
-    const parsed = JSON.parse(raw);
-    if (!isValidState(parsed)) {
-      throw new Error("corrupt goal state at " + statePath);
-    }
-    return normalizeState(parsed);
+    raw = await fs.readFile(statePath, "utf8");
   } catch (err) {
     const code = err.code;
     if (code === "ENOENT") return null;
     throw err;
   }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    await quarantineCorruptState(statePath);
+    throw err;
+  }
+  if (!isValidState(parsed)) {
+    await quarantineCorruptState(statePath);
+    throw new Error("corrupt goal state at " + statePath);
+  }
+  return normalizeState(parsed);
 }
 var tmpCounter = 0;
+var corruptCounter = 0;
+async function fsyncFileBestEffort(tmpPath) {
+  try {
+    const fh = await fs.open(tmpPath, "r");
+    try {
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+  } catch {
+  }
+}
+async function fsyncDirBestEffort(dirPath) {
+  try {
+    const dh = await fs.open(dirPath, "r");
+    try {
+      await dh.sync();
+    } finally {
+      await dh.close();
+    }
+  } catch {
+  }
+}
+async function quarantineCorruptState(statePath) {
+  try {
+    corruptCounter += 1;
+    const dest = statePath + ".corrupt-" + String(process.pid) + "-" + String(corruptCounter);
+    try {
+      await fs.rename(statePath, dest);
+    } catch {
+      try {
+        const raw = await fs.readFile(statePath, "utf8");
+        await fs.writeFile(dest, raw, "utf8");
+      } catch {
+      }
+    }
+  } catch {
+  }
+}
 async function saveGoalState(statePath, state) {
   await fs.mkdir(path.dirname(statePath), { recursive: true });
   tmpCounter += 1;
   const tmpPath = statePath + "." + process.pid + "." + tmpCounter + ".tmp";
   await fs.writeFile(tmpPath, JSON.stringify(state, null, 2), "utf8");
+  await fsyncFileBestEffort(tmpPath);
+  try {
+    await fs.chmod(tmpPath, 384);
+  } catch {
+  }
   await fs.rename(tmpPath, statePath);
+  await fsyncDirBestEffort(path.dirname(statePath));
+  try {
+    await fs.chmod(statePath, 384);
+  } catch {
+  }
 }
 async function acquireClaimLock(lockPath, owner, ttlMs, clock) {
   const now = clock.nowMs();
@@ -228,6 +289,28 @@ function parseGoalCommand(rawInput) {
   }
   return { kind: "set", objective: body };
 }
+var GoalInputSchema = {
+  type: "object",
+  properties: {
+    title: { type: "string", minLength: 1, maxLength: 2e3 }
+  },
+  required: ["title"],
+  additionalProperties: false
+};
+function isSafeGoalTitle(title) {
+  if (typeof title !== "string") return false;
+  const t = title.trim();
+  if (t.length === 0) return false;
+  if (t.length > MAX_OBJECTIVE_LEN) return false;
+  if (t === "..") return false;
+  if (t.startsWith("../") || t.includes("/../") || t.endsWith("/.."))
+    return false;
+  if (t.startsWith("..\\") || t.includes("\\..\\")) return false;
+  if (t.startsWith("/")) return false;
+  if (/^[A-Za-z]:[\\/]/.test(t)) return false;
+  if (/^[A-Za-z]:[^/\\]/.test(t)) return false;
+  return true;
+}
 function setObjective(prev, objective, clock, hostVersion) {
   const fresh = initialState(objective, clock, hostVersion);
   if (prev !== null) {
@@ -277,6 +360,20 @@ var DEFAULT_LIMITS = {
   maxWallMs: 72e5
 };
 var STOP_FILE_NAME = "STOP_GOAL";
+var perSessionLastTick = /* @__PURE__ */ new Map();
+function checkPerSessionCooldown(sessionKey, nowMs, minDelayMs) {
+  const last = perSessionLastTick.get(sessionKey);
+  if (last === void 0) return { ok: true, reason: "ok" };
+  if (nowMs - last < minDelayMs) return { ok: false, reason: "cooldown" };
+  return { ok: true, reason: "ok" };
+}
+function recordPerSessionTick(sessionKey, nowMs) {
+  if (perSessionLastTick.size >= 500 && !perSessionLastTick.has(sessionKey)) {
+    const oldest = perSessionLastTick.keys().next();
+    if (!oldest.done) perSessionLastTick.delete(oldest.value);
+  }
+  perSessionLastTick.set(sessionKey, nowMs);
+}
 function checkBudget(state, nowMs, limits) {
   if (state.iterationCount >= limits.maxTurns) {
     return { ok: false, reason: "max-turns" };
@@ -289,6 +386,8 @@ function checkBudget(state, nowMs, limits) {
 
 // src/loop.ts
 var idleInFlight = false;
+var activeContinueTokens = /* @__PURE__ */ new Map();
+var continueTokenCounter = 0;
 function safeSpend(v) {
   return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0;
 }
@@ -347,6 +446,18 @@ async function handleSessionIdle(ctx, deps) {
   if (typeof deps.ownerId !== "string" || deps.ownerId.length === 0) {
     return { decision: "stopped", reason: "invalid-owner" };
   }
+  const sessionPart = typeof ctx.sessionId === "string" && ctx.sessionId.length > 0 ? ctx.sessionId : "default";
+  const tokenKey = ctx.projectDir + ":" + sessionPart;
+  if (activeContinueTokens.size > 500) {
+    const oldest = activeContinueTokens.keys().next();
+    if (!oldest.done) activeContinueTokens.delete(oldest.value);
+  }
+  if (activeContinueTokens.has(tokenKey)) {
+    return { decision: "skipped", reason: "idle-inflight" };
+  }
+  continueTokenCounter += 1;
+  const myToken = deps.ownerId + ":" + String(continueTokenCounter);
+  activeContinueTokens.set(tokenKey, myToken);
   idleInFlight = true;
   try {
     const statePath = resolveStatePath(ctx.projectDir);
@@ -372,10 +483,28 @@ async function handleSessionIdle(ctx, deps) {
     );
     if (!gate.ok) {
       const terminal = gate.reason === "no-state" || gate.reason.startsWith("stopped-") || gate.reason === "max-turns" || gate.reason === "wall-time" || gate.reason === "stop-file";
+      if ((gate.reason === "max-turns" || gate.reason === "wall-time") && current !== null && current.wrapupSent !== true) {
+        try {
+          await deps.saveState(statePath, {
+            ...current,
+            wrapupSent: true,
+            updatedAtMs: now
+          });
+        } catch {
+        }
+      }
       return {
         decision: terminal ? "stopped" : "skipped",
         reason: gate.reason
       };
+    }
+    const perSession = checkPerSessionCooldown(
+      tokenKey,
+      now,
+      deps.limits.minDelayMs
+    );
+    if (!perSession.ok) {
+      return { decision: "skipped", reason: perSession.reason };
     }
     let claimed;
     try {
@@ -435,8 +564,18 @@ async function handleSessionIdle(ctx, deps) {
     } catch {
       return { decision: "stopped", reason: "save-failed" };
     }
+    try {
+      recordPerSessionTick(tokenKey, afterSend);
+    } catch {
+    }
     return { decision: "sent", reason: "ok", messageId: sent.messageId };
   } finally {
+    try {
+      if (activeContinueTokens.get(tokenKey) === myToken) {
+        activeContinueTokens.delete(tokenKey);
+      }
+    } catch {
+    }
     idleInFlight = false;
   }
 }
@@ -454,6 +593,26 @@ async function snapshotForCompaction(statePath, clock, store) {
     lastContinuedMessageId: typeof next["lastContinuedMessageId"] === "string" ? next["lastContinuedMessageId"] : "",
     restoreCount: typeof next["restoreCount"] === "number" ? next["restoreCount"] : 0
   };
+}
+function buildEvidenceNudge(objective, pendingVerification) {
+  const raw = typeof objective === "string" ? objective : "";
+  const clean = raw.trim().length > 0 ? raw.trim().slice(0, 500) : "active goal";
+  const base = 'Evidence required to complete "' + clean + '": cite files plus passing tests.';
+  if (pendingVerification === true) {
+    return base + " Verification pending, hold auto turns until proof lands.";
+  }
+  return base + " Call /goal complete only with proof, or /goal block <reason>.";
+}
+function pruneIdleControllers(controllers, live) {
+  for (const c of [...controllers]) {
+    if (c === live) continue;
+    try {
+      c.abort();
+    } catch {
+    }
+    controllers.delete(c);
+  }
+  controllers.add(live);
 }
 async function restoreAfterCompaction(statePath, clock, store) {
   const raw = await store.loadState(statePath);
@@ -490,13 +649,180 @@ function resolveEvidencePath(projectDir) {
 function emptyEvidence(nowMs) {
   return { version: EVIDENCE_VERSION, updatedAtMs: nowMs, criteria: [] };
 }
+function validateEvidenceShape(ev) {
+  if (ev === null || typeof ev !== "object")
+    return { ok: false, reason: "evidence-not-object" };
+  const v = ev;
+  if (v["version"] !== EVIDENCE_VERSION)
+    return { ok: false, reason: "evidence-bad-version" };
+  if (!Array.isArray(v["criteria"]))
+    return { ok: false, reason: "evidence-bad-criteria" };
+  const list = v["criteria"];
+  if (list.length === 0) return { ok: false, reason: "evidence-empty" };
+  for (const item of list) {
+    if (item === null || typeof item !== "object")
+      return { ok: false, reason: "criterion-not-object" };
+    const c = item;
+    if (typeof c["id"] !== "string" || c["id"].length === 0)
+      return { ok: false, reason: "criterion-bad-id" };
+    if (typeof c["claim"] !== "string" || c["claim"].length === 0)
+      return { ok: false, reason: "criterion-bad-claim" };
+    if (!Array.isArray(c["files"]) || c["files"].length === 0)
+      return { ok: false, reason: "criterion-missing-files" };
+    if (!Array.isArray(c["tests"]) || c["tests"].length === 0)
+      return { ok: false, reason: "criterion-missing-tests" };
+  }
+  return { ok: true, reason: "ok" };
+}
+function hashEvidence(ev) {
+  const raw = JSON.stringify({ version: ev.version, criteria: ev.criteria });
+  return createHash("sha256").update(raw).digest("hex").slice(0, 16);
+}
+async function loadEvidence(projectDir) {
+  try {
+    const raw = await fs2.readFile(resolveEvidencePath(projectDir), "utf8");
+    const parsed = JSON.parse(raw);
+    const shape = validateEvidenceShape(parsed);
+    if (!shape.ok) return null;
+    return parsed;
+  } catch (e) {
+    const code = e.code;
+    if (code === "ENOENT") return null;
+    return null;
+  }
+}
 async function saveEvidence(projectDir, ev) {
   const target = resolveEvidencePath(projectDir);
   await fs2.mkdir(path2.dirname(target), { recursive: true });
   evidenceTmpCounter += 1;
   const tmp = target + ".tmp-" + String(process.pid) + "-" + String(evidenceTmpCounter);
   await fs2.writeFile(tmp, JSON.stringify(ev, null, 2), "utf8");
+  try {
+    const fh = await fs2.open(tmp, "r");
+    try {
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+  } catch {
+  }
+  try {
+    await fs2.chmod(tmp, 384);
+  } catch {
+  }
   await fs2.rename(tmp, target);
+  try {
+    await fs2.chmod(target, 384);
+  } catch {
+  }
+}
+
+// src/verifier.ts
+import { promises as fs3 } from "fs";
+import path3 from "path";
+function isCitationInsideProjectDir(projectDir, citation) {
+  try {
+    if (typeof citation !== "string") {
+      return false;
+    }
+    if (citation.trim() === "") {
+      return false;
+    }
+    const base = path3.resolve(projectDir);
+    const target = path3.resolve(base, citation);
+    const rel = path3.relative(base, target);
+    if (rel === "" || rel === ".") {
+      return false;
+    }
+    if (rel === ".." || rel.startsWith(".." + path3.sep) || path3.isAbsolute(rel)) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+function getSubagentRunner(host) {
+  if (host === null || typeof host !== "object") return null;
+  const h = host;
+  for (const key of ["spawnSubagent", "runSubagent", "createTask"]) {
+    if (typeof h[key] === "function") return h[key];
+  }
+  return null;
+}
+async function verifyLocal(projectDir, evidence) {
+  if (evidence === null)
+    return {
+      ok: false,
+      reason: "missing-evidence",
+      failures: ["no evidence file"]
+    };
+  const shape = validateEvidenceShape(evidence);
+  if (!shape.ok)
+    return { ok: false, reason: shape.reason, failures: [shape.reason] };
+  const failures = [];
+  for (const c of evidence.criteria) {
+    for (const f of c.files) {
+      if (!isCitationInsideProjectDir(projectDir, f)) {
+        failures.push("traversal-escape:" + c.id + ":" + String(f));
+        continue;
+      }
+      try {
+        const p = path3.isAbsolute(f) ? f : path3.join(projectDir, f);
+        const st = await fs3.stat(p);
+        if (!st.isFile()) {
+          failures.push("not-a-file:" + c.id + ":" + String(f));
+        }
+      } catch {
+        failures.push("missing-file:" + c.id + ":" + String(f));
+      }
+    }
+    const passing = c.tests.some(
+      (t) => typeof t.command === "string" && t.command.length > 0 && t.exitCode === 0
+    );
+    if (!passing) failures.push("missing-passing-test:" + c.id);
+  }
+  if (failures.length > 0)
+    return { ok: false, reason: "evidence-invalid", failures };
+  return { ok: true, reason: "ok:" + hashEvidence(evidence), failures: [] };
+}
+async function verifyCompletion(args) {
+  try {
+    const local = await verifyLocal(args.projectDir, args.evidence);
+    if (!local.ok) return local;
+    if (args.useSubagent !== true) return local;
+    const runner = getSubagentRunner(args.host ?? null);
+    if (runner === null) return local;
+    if (args.evidence === null) return local;
+    const out = await runner({
+      stateSummary: args.stateSummary ?? "",
+      evidence: args.evidence
+    });
+    if (out.pass === true)
+      return {
+        ok: true,
+        reason: "subagent-pass:" + local.reason,
+        failures: []
+      };
+    return {
+      ok: false,
+      reason: "subagent-fail:" + String(out.reason),
+      failures: ["subagent rejected"]
+    };
+  } catch {
+    return {
+      ok: false,
+      reason: "verifier-error",
+      failures: ["verifier threw"]
+    };
+  }
+}
+async function tryCompleteWithEvidence(args) {
+  const got = await verifyCompletion(args);
+  if (!got.ok && got.reason === "missing-evidence") {
+    return { ok: false, reason: "evidence-required", failures: got.failures };
+  }
+  return got;
 }
 
 // src/index.ts
@@ -539,6 +865,13 @@ async function handleGoalCommand(rawInput, projectDir, clock = new SystemClock()
     return "Goal " + current.status + ": " + current.objective;
   }
   if (parsed.kind === "set") {
+    const schemaOk = GoalInputSchema.required.includes("title") && GoalInputSchema.additionalProperties === false && typeof parsed.objective === "string" && parsed.objective.trim().length >= 1 && parsed.objective.length <= 2e3;
+    if (!schemaOk) {
+      return "Invalid /goal usage. Try /goal <objective> or /goal status.";
+    }
+    if (!isSafeGoalTitle(parsed.objective)) {
+      return "Invalid /goal usage. Objective must not be a path escape.";
+    }
     const next = setObjective(current, parsed.objective, clock, hostVersion);
     try {
       await saveGoalState(statePath, next);
@@ -572,6 +905,18 @@ async function handleGoalCommand(rawInput, projectDir, clock = new SystemClock()
       return "Only an active goal can complete. Current status: " + current.status + ".";
     }
     try {
+      const ev = await loadEvidence(projectDir);
+      const check = await tryCompleteWithEvidence({
+        projectDir,
+        evidence: ev
+      });
+      if (!check.ok) {
+        return "Complete blocked: " + check.reason + ". Add file citations plus passing tests to evidence.";
+      }
+    } catch {
+      return "Complete blocked: verifier-error. Add evidence and retry.";
+    }
+    try {
       await saveGoalState(statePath, next);
     } catch (err) {
       return "Failed to save goal state: " + err.message;
@@ -592,7 +937,7 @@ function handleIdleStub() {
 function defaultHasStopFile(projectDir) {
   return async () => {
     try {
-      await fs3.access(path3.join(projectDir, ".opencode", STOP_FILE_NAME));
+      await fs4.access(path4.join(projectDir, ".opencode", STOP_FILE_NAME));
       return true;
     } catch (e) {
       const code = e.code;
@@ -634,7 +979,16 @@ function registerIdleHandler(host, opts) {
       lastId = null;
     }
     const ctx = { projectDir: opts.projectDir, lastMessageId: lastId };
-    const deps = { clock, limits, ownerId, loadState: loadGoalState, saveState: saveGoalState, tryClaim: tryClaimLease, sendPrompt: opts.sendPrompt, hasStopFile };
+    const deps = {
+      clock,
+      limits,
+      ownerId,
+      loadState: loadGoalState,
+      saveState: saveGoalState,
+      tryClaim: tryClaimLease,
+      sendPrompt: opts.sendPrompt,
+      hasStopFile
+    };
     try {
       await handleSessionIdle(ctx, deps);
     } catch {
@@ -731,20 +1085,54 @@ var index_default = Plugin.define({
                 const text = typeof inv.prompt?.text === "string" ? inv.prompt.text : "";
                 const parsed = parseGoalCommand("/goal " + text);
                 if (parsed.kind === "set") {
+                  if (!isSafeGoalTitle(parsed.objective)) {
+                    if (sessionID !== "") {
+                      const session = ctx.session;
+                      try {
+                        await session?.synthetic?.({
+                          sessionID,
+                          text: "Invalid /goal usage. Objective must not be a path escape."
+                        });
+                      } catch {
+                      }
+                    }
+                    return;
+                  }
                   const statePath = resolveStatePath(projectDir);
-                  const current = await loadGoalState(statePath).catch(() => null);
-                  const next = setObjective(current, parsed.objective, clock, "2.0.29");
+                  const current = await loadGoalState(statePath).catch(
+                    () => null
+                  );
+                  const next = setObjective(
+                    current,
+                    parsed.objective,
+                    clock,
+                    "2.0.29"
+                  );
                   await saveGoalState(statePath, next);
-                  await saveEvidence(projectDir, emptyEvidence(clock.nowMs())).catch(() => void 0);
+                  await saveEvidence(
+                    projectDir,
+                    emptyEvidence(clock.nowMs())
+                  ).catch(() => void 0);
                   if (sessionID !== "") {
-                    await ctx.session?.prompt?.({ sessionID, text: buildGoalWorkInstruction(next.objective, next.iterationCount) }).catch(() => void 0);
+                    await ctx.session?.prompt?.({
+                      sessionID,
+                      text: buildGoalWorkInstruction(
+                        next.objective,
+                        next.iterationCount
+                      )
+                    }).catch(() => void 0);
                   }
                   return;
                 }
-                const message = await handleGoalCommand("/goal " + text, projectDir, clock);
+                const message = await handleGoalCommand(
+                  "/goal " + text,
+                  projectDir,
+                  clock
+                );
                 if (sessionID !== "") {
                   const session = ctx.session;
-                  if (session !== void 0) await notifySynthetic(session, sessionID, message);
+                  if (session !== void 0)
+                    await notifySynthetic(session, sessionID, message);
                 }
               } catch {
               }
@@ -755,11 +1143,16 @@ var index_default = Plugin.define({
     } catch {
     }
     const controller = new AbortController();
+    const idleAbortControllers = /* @__PURE__ */ new Set();
+    idleAbortControllers.add(controller);
     const idleTask = (async () => {
       try {
         const events = ctx.event;
-        if (events === void 0 || typeof events.subscribe !== "function") return;
-        const stream = events.subscribe({ signal: controller.signal });
+        if (events === void 0 || typeof events.subscribe !== "function")
+          return;
+        const stream = events.subscribe({
+          signal: controller.signal
+        });
         for await (const event of stream) {
           try {
             if (event === null || typeof event !== "object") continue;
@@ -769,7 +1162,8 @@ var index_default = Plugin.define({
             const rawID = data?.sessionID ?? props?.sessionID;
             if (typeof rawID !== "string" || rawID.length === 0) continue;
             const session = ctx.session;
-            if (session === void 0 || typeof session.prompt !== "function") continue;
+            if (session === void 0 || typeof session.prompt !== "function")
+              continue;
             const promptFn = session.prompt.bind(session);
             const deps = {
               clock,
@@ -779,14 +1173,20 @@ var index_default = Plugin.define({
               saveState: saveGoalState,
               tryClaim: tryClaimLease,
               sendPrompt: async (prompt) => {
-                const res = await promptFn({ sessionID: rawID, text: prompt }).catch(() => null);
+                const res = await promptFn({
+                  sessionID: rawID,
+                  text: prompt
+                }).catch(() => null);
                 const messageID = typeof res?.messageID === "string" && res.messageID.length > 0 ? res.messageID : "turn-unlabeled";
                 const tokenSpend = typeof res?.tokenSpend === "number" ? res.tokenSpend : 0;
                 return { messageId: messageID, tokenSpend };
               },
               hasStopFile
             };
-            await handleSessionIdle({ projectDir, lastMessageId: null }, deps);
+            await handleSessionIdle(
+              { projectDir, lastMessageId: null, sessionId: rawID },
+              deps
+            );
           } catch {
           }
         }
@@ -800,6 +1200,11 @@ var index_default = Plugin.define({
           try {
             const e = event;
             if (typeof e.sessionID !== "string") return;
+            try {
+              pruneIdleControllers(idleAbortControllers, controller);
+            } catch {
+              idleAbortControllers.add(controller);
+            }
             void loadGoalState(resolveStatePath(projectDir)).then((state) => {
               if (state === null || state.status !== "active") return;
               if (!Array.isArray(e.messages)) return;
@@ -817,7 +1222,14 @@ var index_default = Plugin.define({
             void loadGoalState(resolveStatePath(projectDir)).then((state) => {
               if (state === null || state.status !== "active") return;
               if (!Array.isArray(e.system)) return;
-              e.system.push({ type: "text", text: 'Active goal: "' + state.objective + '". Finish with evidence, or report blocked.' });
+              const nudge = buildEvidenceNudge(
+                state.objective,
+                state.pendingVerification
+              );
+              e.system.push({
+                type: "text",
+                text: 'Active goal: "' + state.objective + '". ' + nudge
+              });
             }).catch(() => void 0);
           } catch {
           }
@@ -828,6 +1240,16 @@ var index_default = Plugin.define({
     return () => {
       try {
         controller.abort();
+      } catch {
+      }
+      try {
+        for (const c of idleAbortControllers) {
+          try {
+            c.abort();
+          } catch {
+          }
+        }
+        idleAbortControllers.clear();
       } catch {
       }
       void idleTask.catch(() => void 0);
