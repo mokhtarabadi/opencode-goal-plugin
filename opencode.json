@@ -1,0 +1,7 @@
+{
+  "name": "opencode-goal-plugin",
+  "version": "0.1.0",
+  "entry": "dist/index.js",
+  "host": ">=2.0.29",
+  "commands": ["commands/goal.md"]
+}
