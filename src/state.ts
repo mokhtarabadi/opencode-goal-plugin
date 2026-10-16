@@ -21,7 +21,7 @@ export class SystemClock implements Clock {
   }
 }
 
-/** Persisted goal state shape. */
+/** Persisted goal state shape. Phase 2 adds turn tracking for the idle loop. */
 export interface GoalState {
   objective: string;
   status: GoalStatus;
@@ -34,6 +34,8 @@ export interface GoalState {
   createdAtMs: number;
   updatedAtMs: number;
   hostVersion: string;
+  lastTurnAtMs: number;
+  lastContinuedMessageId: string;
 }
 
 export const STATE_FILENAME = 'goal-state.json';
@@ -72,7 +74,9 @@ export function initialState(objective: string, clock: Clock, hostVersion: strin
     lastSummary: '',
     createdAtMs: now,
     updatedAtMs: now,
-    hostVersion
+    hostVersion,
+    lastTurnAtMs: 0,
+    lastContinuedMessageId: ''
   };
 }
 
@@ -97,7 +101,23 @@ function isValidState(value: unknown): value is GoalState {
   if (typeof v['createdAtMs'] !== 'number') return false;
   if (typeof v['updatedAtMs'] !== 'number') return false;
   if (typeof v['hostVersion'] !== 'string') return false;
+  // Phase 2 fields stay optional so Phase 1 files load, then normalize fills them.
+  if ('lastTurnAtMs' in v && typeof v['lastTurnAtMs'] !== 'number') return false;
+  if ('lastContinuedMessageId' in v && typeof v['lastContinuedMessageId'] !== 'string') return false;
   return true;
+}
+
+/**
+ * Fill Phase 2 defaults for Phase 1 files missing new fields.
+ * @param input validated state possibly missing new fields
+ */
+export function normalizeState(input: GoalState): GoalState {
+  // Nullish fallback fills runtime-undefined fields from Phase 1 files.
+  return {
+    ...input,
+    lastTurnAtMs: input.lastTurnAtMs ?? 0,
+    lastContinuedMessageId: input.lastContinuedMessageId ?? ''
+  };
 }
 
 /**
@@ -112,7 +132,8 @@ export async function loadGoalState(statePath: string): Promise<GoalState | null
     if (!isValidState(parsed)) {
       throw new Error('corrupt goal state at ' + statePath);
     }
-    return parsed;
+    // Normalize so Phase 1 files gain Phase 2 turn-tracking defaults.
+    return normalizeState(parsed);
   } catch (err: unknown) {
     // ENOENT maps to null so callers handle first-run cleanly.
     const code = (err as { code?: string }).code;

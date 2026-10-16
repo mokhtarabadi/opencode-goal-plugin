@@ -72,3 +72,20 @@ describe('state validation edges', () => {
     await expect(loadGoalState(sp)).rejects.toThrow();
   });
 });
+
+describe('file claim concurrency', () => {
+  it('parallel file claims yield exactly one winner', async () => {
+    // Real-file proof for the wx claim lock: two processes worth of
+    // concurrency collapse to one winner (QA F1, ADR-002).
+    const dir = mkdtempSync(path.join(tmpdir(), 'goal-claim-'));
+    const sp = resolveStatePath(dir);
+    const clock = new FakeClock(1700000000000);
+    await saveGoalState(sp, initialState('claim race', clock, '2.0.29'));
+    const out = await Promise.all([
+      tryClaimLease(sp, 'file-A', LEASE_TTL_MS, clock),
+      tryClaimLease(sp, 'file-B', LEASE_TTL_MS, clock)
+    ]);
+    const wins = out.filter((r) => r.claimed).length;
+    expect(wins).toBe(1);
+  });
+});

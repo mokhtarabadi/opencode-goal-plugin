@@ -1,14 +1,19 @@
 /**
- * Plugin entry for opencode-goal-plugin Phase 1.
+ * Plugin entry Phase 2.
  * Why this file exists: single public surface for ESM plus CJS hosts.
- * Phase 1 handles slash goal set and status only, no idle auto-continue.
+ * Slash goal keeps Phase 1 guarded behavior, idle auto-continue is the new opt-in wiring.
  */
-import { SystemClock, loadGoalState, resolveStatePath, saveGoalState } from './state.js';
+import * as path from 'node:path';
+import { promises as fs } from 'node:fs';
+import { SystemClock, loadGoalState, resolveStatePath, saveGoalState, tryClaimLease } from './state.js';
 import type { Clock, GoalState } from './state.js';
 import { blockGoal, clearGoal, completeGoal, parseGoalCommand, setObjective } from './goal.js';
+import { handleSessionIdle } from './loop.js';
+import { DEFAULT_LIMITS, STOP_FILE_NAME } from './limits.js';
+import type { Limits } from './limits.js';
 
 export const PLUGIN_NAME = 'opencode-goal-plugin';
-export const PLUGIN_VERSION = '0.1.0';
+export const PLUGIN_VERSION = '0.2.0';
 
 /** Minimal host shape, all fields optional so probing never throws. */
 export interface MinimalHost {
@@ -41,11 +46,9 @@ export function getAvailableHooks(host: unknown): string[] {
 
 /**
  * Handle a slash goal command against file state.
- * Every failure returns a friendly string: invalid input, bad directory,
- * corrupt state, wrong-status transitions, and save failures each report
- * their own cause instead of throwing or masking each other.
+ * Every failure returns a friendly string, never throws.
  * @param rawInput raw input like /goal ship feature
- * @param projectDir project root containing .opencode dir
+ * @param projectDir project root containing the .opencode dir
  * @param clock injected clock, defaults to SystemClock
  * @param hostVersion host version string for audit
  */
@@ -55,7 +58,7 @@ export async function handleGoalCommand(
   clock: Clock = new SystemClock(),
   hostVersion: string = '2.0.29'
 ): Promise<string> {
-  // Type guards first: a misbehaving host must get a message, never a TypeError.
+  // Type guards first: a misbehaving host gets a message, never a TypeError.
   if (typeof rawInput !== 'string') {
     return 'Invalid /goal usage. Try /goal <objective> or /goal status.';
   }
@@ -131,10 +134,96 @@ export async function handleGoalCommand(
 }
 
 /**
- * Phase 1 idle stub. Always returns not-implemented so no loop runs yet.
+ * Phase 1 stub kept for compatibility.
  */
 export function handleIdleStub(): string {
   return 'phase2-not-implemented';
+}
+
+/** Options for idle registration. */
+export interface RegisterIdleOptions {
+  projectDir: string;
+  getLastMessageId: () => string | null;
+  sendPrompt: (prompt: string) => Promise<{ messageId: string; tokenSpend?: number }>;
+  clock?: Clock;
+  limits?: Limits;
+  ownerId?: string;
+}
+
+/**
+ * Build a stop-file checker for one project dir.
+ * @param projectDir project root containing the .opencode dir
+ */
+export function defaultHasStopFile(projectDir: string): () => Promise<boolean> {
+  return async () => {
+    try {
+      await fs.access(path.join(projectDir, '.opencode', STOP_FILE_NAME));
+      return true;
+    } catch (e: unknown) {
+      // ENOENT means no kill switch. Any other error fails closed: the
+      // idle handler maps the throw to stop-check-failed instead of ignoring STOP_GOAL.
+      const code = (e as { code?: string }).code;
+      if (code === 'ENOENT') return false;
+      throw e;
+    }
+  };
+}
+
+/**
+ * Register the idle handler only when the host supports onIdle, fail closed otherwise.
+ * @param host unknown host object from OpenCode V2
+ * @param opts project dir plus host callbacks
+ */
+export function registerIdleHandler(host: unknown, opts: RegisterIdleOptions): { registered: boolean; reason: string } {
+  // Opts guards first: bad input gets a reason string, never a TypeError.
+  if (opts === null || typeof opts !== 'object') {
+    return { registered: false, reason: 'invalid-opts' };
+  }
+  if (typeof opts.projectDir !== 'string' || opts.projectDir.trim().length === 0) {
+    return { registered: false, reason: 'invalid-opts' };
+  }
+  if (typeof opts.getLastMessageId !== 'function' || typeof opts.sendPrompt !== 'function') {
+    return { registered: false, reason: 'invalid-opts' };
+  }
+  // Probe first so unknown hosts get a reason string, never an exception.
+  const hooks = getAvailableHooks(host);
+  if (!hooks.includes('onIdle')) {
+    return { registered: false, reason: 'idle-hook-unavailable' };
+  }
+  const h = host as { onIdle?: unknown };
+  if (typeof h.onIdle !== 'function') {
+    return { registered: false, reason: 'idle-hook-unavailable' };
+  }
+  const clock = opts.clock ?? new SystemClock();
+  const limits = opts.limits ?? DEFAULT_LIMITS;
+  // Random owner suffix separates this process from other loop runners.
+  const ownerId = opts.ownerId ?? ('idle-' + String(process.pid) + '-' + String(Math.floor(Math.random() * 1000000)));
+  if (typeof ownerId !== 'string' || ownerId.length === 0) {
+    return { registered: false, reason: 'invalid-opts' };
+  }
+  const hasStopFile = defaultHasStopFile(opts.projectDir);
+  const cb = async (): Promise<void> => {
+    // Safe callback: host callbacks must never throw into the host loop.
+    let lastId: string | null = null;
+    try {
+      lastId = opts.getLastMessageId() ?? null;
+    } catch {
+      lastId = null;
+    }
+    const ctx = { projectDir: opts.projectDir, lastMessageId: lastId };
+    const deps = { clock, limits, ownerId, loadState: loadGoalState, saveState: saveGoalState, tryClaim: tryClaimLease, sendPrompt: opts.sendPrompt, hasStopFile };
+    try {
+      await handleSessionIdle(ctx, deps);
+    } catch {
+      // handleSessionIdle already maps its own failures; this is a final net.
+    }
+  };
+  try {
+    (h.onIdle as (cb: () => Promise<void>) => void)(cb);
+    return { registered: true, reason: 'ok' };
+  } catch {
+    return { registered: false, reason: 'register-failed' };
+  }
 }
 
 const plugin = {
@@ -142,7 +231,9 @@ const plugin = {
   version: PLUGIN_VERSION,
   getAvailableHooks,
   handleGoalCommand,
-  handleIdleStub
+  handleIdleStub,
+  registerIdleHandler,
+  defaultHasStopFile
 };
 
 export default plugin;
