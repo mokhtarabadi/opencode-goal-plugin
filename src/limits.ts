@@ -19,7 +19,7 @@ export interface Limits {
 export const DEFAULT_LIMITS: Limits = {
   minDelayMs: 20000,
   maxTurns: 30,
-  maxWallMs: 7200000
+  maxWallMs: 7200000,
 };
 
 /** Kill-switch filename inside the .opencode dir. Presence stops the loop. */
@@ -31,7 +31,11 @@ export const STOP_FILE_NAME = 'STOP_GOAL';
  * @param nowMs injected now in epoch ms
  * @param limits active limits
  */
-export function checkBudget(state: GoalState, nowMs: number, limits: Limits): { ok: boolean; reason: string } {
+export function checkBudget(
+  state: GoalState,
+  nowMs: number,
+  limits: Limits,
+): { ok: boolean; reason: string } {
   // Turn budget binds first: each sent continuation costs one turn.
   if (state.iterationCount >= limits.maxTurns) {
     return { ok: false, reason: 'max-turns' };

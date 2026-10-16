@@ -21,7 +21,11 @@ class FakeClock implements Clock {
 describe('handleGoalCommand guards', () => {
   it('handles non-string input without throw', async () => {
     const dir = mkdtempSync(path.join(tmpdir(), 'goal-guard-'));
-    const got = await handleGoalCommand(null as unknown as string, dir, new FakeClock());
+    const got = await handleGoalCommand(
+      null as unknown as string,
+      dir,
+      new FakeClock(),
+    );
     expect(got).toContain('Invalid /goal usage');
   });
   it('handles bad project dir without throw', async () => {

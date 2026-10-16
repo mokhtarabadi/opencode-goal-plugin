@@ -6,7 +6,14 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { LEASE_TTL_MS, initialState, loadGoalState, resolveStatePath, saveGoalState, tryClaimLease } from '../src/state.js';
+import {
+  LEASE_TTL_MS,
+  initialState,
+  loadGoalState,
+  resolveStatePath,
+  saveGoalState,
+  tryClaimLease,
+} from '../src/state.js';
 import type { Clock } from '../src/state.js';
 
 class FakeClock implements Clock {
@@ -46,7 +53,7 @@ describe('state roundtrip', () => {
     await saveGoalState(statePath, initialState('a', clock, '2.0.29'));
     const results = await Promise.all([
       tryClaimLease(statePath, 'idle-A', LEASE_TTL_MS, clock),
-      tryClaimLease(statePath, 'idle-B', LEASE_TTL_MS, clock)
+      tryClaimLease(statePath, 'idle-B', LEASE_TTL_MS, clock),
     ]);
     const wins = results.filter((r) => r.claimed).length;
     expect(wins).toBe(1);
@@ -60,7 +67,11 @@ describe('state validation edges', () => {
     const dir = mkdtempSync(path.join(tmpdir(), 'goal-partial-'));
     const sp = resolveStatePath(dir);
     await fsp.mkdir(path.dirname(sp), { recursive: true });
-    await fsp.writeFile(sp, JSON.stringify({ objective: 'x', status: 'active', updatedAtMs: 1 }), 'utf8');
+    await fsp.writeFile(
+      sp,
+      JSON.stringify({ objective: 'x', status: 'active', updatedAtMs: 1 }),
+      'utf8',
+    );
     await expect(loadGoalState(sp)).rejects.toThrow();
   });
   it('rejects corrupt json', async () => {
@@ -83,7 +94,7 @@ describe('file claim concurrency', () => {
     await saveGoalState(sp, initialState('claim race', clock, '2.0.29'));
     const out = await Promise.all([
       tryClaimLease(sp, 'file-A', LEASE_TTL_MS, clock),
-      tryClaimLease(sp, 'file-B', LEASE_TTL_MS, clock)
+      tryClaimLease(sp, 'file-B', LEASE_TTL_MS, clock),
     ]);
     const wins = out.filter((r) => r.claimed).length;
     expect(wins).toBe(1);

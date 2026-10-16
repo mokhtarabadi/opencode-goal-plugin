@@ -54,27 +54,44 @@ export function parseGoalCommand(rawInput: string): ParsedGoal {
   }
   const bodyLower = body.toLowerCase();
   if (bodyLower === 'status') return { kind: 'status' };
-  if (bodyLower.startsWith('status ') || bodyLower.startsWith('status\t') || bodyLower.startsWith('status\n')) {
+  if (
+    bodyLower.startsWith('status ') ||
+    bodyLower.startsWith('status\t') ||
+    bodyLower.startsWith('status\n')
+  ) {
     // status takes no arguments; extra words are likely a mistyped objective.
     return { kind: 'invalid', raw: rawInput };
   }
   if (bodyLower === 'clear') return { kind: 'clear' };
-  if (bodyLower.startsWith('clear ') || bodyLower.startsWith('clear\t') || bodyLower.startsWith('clear\n')) {
+  if (
+    bodyLower.startsWith('clear ') ||
+    bodyLower.startsWith('clear\t') ||
+    bodyLower.startsWith('clear\n')
+  ) {
     return { kind: 'invalid', raw: rawInput };
   }
   if (bodyLower === 'complete') return { kind: 'complete' };
-  if (bodyLower.startsWith('complete ') || bodyLower.startsWith('complete\t') || bodyLower.startsWith('complete\n')) {
+  if (
+    bodyLower.startsWith('complete ') ||
+    bodyLower.startsWith('complete\t') ||
+    bodyLower.startsWith('complete\n')
+  ) {
     return { kind: 'invalid', raw: rawInput };
   }
   if (bodyLower === 'block') {
     // Bare block names no reason, so the blocked state would be unactionable.
     return { kind: 'invalid', raw: rawInput };
   }
-  if (bodyLower.startsWith('block ') || bodyLower.startsWith('block\t') || bodyLower.startsWith('block\n')) {
+  if (
+    bodyLower.startsWith('block ') ||
+    bodyLower.startsWith('block\t') ||
+    bodyLower.startsWith('block\n')
+  ) {
     const reason = body.slice(6).trim();
     if (reason.length === 0) return { kind: 'invalid', raw: rawInput };
     // Overlong reasons are rejected like overlong objectives.
-    if (reason.length > MAX_OBJECTIVE_LEN) return { kind: 'invalid', raw: rawInput };
+    if (reason.length > MAX_OBJECTIVE_LEN)
+      return { kind: 'invalid', raw: rawInput };
     return { kind: 'block', reason };
   }
   if (body.length > MAX_OBJECTIVE_LEN) {
@@ -90,7 +107,12 @@ export function parseGoalCommand(rawInput: string): ParsedGoal {
  * @param clock injected clock
  * @param hostVersion host version for audit
  */
-export function setObjective(prev: GoalState | null, objective: string, clock: Clock, hostVersion: string): GoalState {
+export function setObjective(
+  prev: GoalState | null,
+  objective: string,
+  clock: Clock,
+  hostVersion: string,
+): GoalState {
   // Fresh state keeps history simple for Phase 1, counters restart per objective.
   const fresh = initialState(objective, clock, hostVersion);
   if (prev !== null) {
@@ -106,7 +128,11 @@ export function setObjective(prev: GoalState | null, objective: string, clock: C
  * @param reason block reason
  * @param clock injected clock
  */
-export function blockGoal(current: GoalState, reason: string, clock: Clock): GoalState {
+export function blockGoal(
+  current: GoalState,
+  reason: string,
+  clock: Clock,
+): GoalState {
   if (current.status !== 'active') {
     throw new Error('only active goal can be blocked');
   }
@@ -116,7 +142,7 @@ export function blockGoal(current: GoalState, reason: string, clock: Clock): Goa
     lastSummary: reason,
     leaseOwner: null,
     leaseExpiresAtMs: 0,
-    updatedAtMs: clock.nowMs()
+    updatedAtMs: clock.nowMs(),
   };
 }
 
@@ -134,7 +160,7 @@ export function completeGoal(current: GoalState, clock: Clock): GoalState {
     status: 'complete',
     leaseOwner: null,
     leaseExpiresAtMs: 0,
-    updatedAtMs: clock.nowMs()
+    updatedAtMs: clock.nowMs(),
   };
 }
 
@@ -149,6 +175,6 @@ export function clearGoal(current: GoalState, clock: Clock): GoalState {
     status: 'cleared',
     leaseOwner: null,
     leaseExpiresAtMs: 0,
-    updatedAtMs: clock.nowMs()
+    updatedAtMs: clock.nowMs(),
   };
 }

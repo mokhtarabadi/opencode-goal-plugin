@@ -27,7 +27,10 @@ describe('checkBudget', () => {
   });
   it('wall time stops', () => {
     const c = new FakeClock();
-    const s = { ...initialState('a', c, '2.0.29'), createdAtMs: c.nowMs() - 7200000 - 1 };
+    const s = {
+      ...initialState('a', c, '2.0.29'),
+      createdAtMs: c.nowMs() - 7200000 - 1,
+    };
     expect(checkBudget(s, c.nowMs(), DEFAULT_LIMITS).reason).toBe('wall-time');
   });
 });

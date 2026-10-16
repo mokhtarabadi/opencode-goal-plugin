@@ -68,6 +68,7 @@ Tight loop risk: cooldown plus single-flight lease plus max turns. Rollback is r
 - Hotfix command: cd ~/Develop/Projects/opencode-goal-plugin && npm run typecheck | Expected: exit 0 | Actual: exit 0 clean | Exit: 0.
 - Hotfix round 2 command: cd ~/Develop/Projects/opencode-goal-plugin && rtk test npm test | Expected: all pass | Actual: 5 files 46 tests passed (40 existing plus 6 new) | Exit: 0.
 - Hotfix round 2 command: file-claim concurrency focused runs x3 | Expected: stable one winner | Actual: 2 passed 4 skipped x3, stable | Exit: 0.
+- Closure commit: feature 594148b299dffa3f1ab2fa0ceae275bce6b3740a plus chore close commit on top via commit_and_clean_task (Night Work delegated closure).
 - Hotfix command: cd ~/Develop/Projects/opencode-goal-plugin && npm run build | Expected: ESM plus CJS plus DTS | Actual: Build success | Exit: 0.
 - Hotfix command: grep -R "Date.now" src | Expected: single source | Actual: only SystemClock.nowMs plus one comment | Exit: 0.
 

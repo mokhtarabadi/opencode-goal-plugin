@@ -5,3 +5,4 @@ context-reports/
 tmp-clones/
 evidence/*.log
 evidence/*.tgz
+tasks/.sessions/

@@ -3,7 +3,13 @@
  * Why these tests exist: lock Phase 1 contract for set plus status plus block plus complete plus clear.
  */
 import { describe, expect, it } from 'vitest';
-import { blockGoal, clearGoal, completeGoal, parseGoalCommand, setObjective } from '../src/goal.js';
+import {
+  blockGoal,
+  clearGoal,
+  completeGoal,
+  parseGoalCommand,
+  setObjective,
+} from '../src/goal.js';
 import type { Clock } from '../src/state.js';
 
 class FakeClock implements Clock {
@@ -25,7 +31,9 @@ describe('parseGoalCommand', () => {
   });
   it('rejects empty and overlong', () => {
     expect(parseGoalCommand('/goal   ').kind).toBe('invalid');
-    expect(parseGoalCommand('/goal ' + 'x'.repeat(2001))).toEqual(expect.objectContaining({ kind: 'invalid' }));
+    expect(parseGoalCommand('/goal ' + 'x'.repeat(2001))).toEqual(
+      expect.objectContaining({ kind: 'invalid' }),
+    );
   });
 });
 
@@ -66,7 +74,9 @@ describe('parseGoalCommand edges', () => {
     expect(parseGoalCommand('/goal complete extra').kind).toBe('invalid');
   });
   it('rejects overlong block reason', () => {
-    expect(parseGoalCommand('/goal block ' + 'x'.repeat(2001)).kind).toBe('invalid');
+    expect(parseGoalCommand('/goal block ' + 'x'.repeat(2001)).kind).toBe(
+      'invalid',
+    );
   });
   it('rejects non-string input', () => {
     expect(parseGoalCommand(null as unknown as string).kind).toBe('invalid');

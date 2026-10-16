@@ -70,6 +70,7 @@ Compaction double-resume guarded by lease plus message id continuity plus no-sen
 - Hotfix command: cd ~/Develop/Projects/opencode-goal-plugin && npm run typecheck | Expected: exit 0 | Actual: exit 0 clean | Exit: 0.
 - Hotfix command: cd ~/Develop/Projects/opencode-goal-plugin && rtk test npm test | Expected: all pass | Actual: 9 files 62 tests passed (56 existing plus 6 new) | Exit: 0.
 - Review fixes command: formatter plus reset alias plus pause test, rtk test npm test | Expected: all pass | Actual: 9 files 62 tests passed | Exit: 0.
+- Closure commit: feature 1fcf1426f70d2d59aa3199587c04fc3056411741 plus chore close commit on top via commit_and_clean_task (Night Work delegated closure).
 - Hotfix command: cd ~/Develop/Projects/opencode-goal-plugin && npm run build | Expected: ESM plus CJS plus DTS | Actual: Build success | Exit: 0.
 
 ## Factual Git Diff

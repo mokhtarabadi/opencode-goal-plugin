@@ -72,6 +72,8 @@ Lease lock is best-effort file locking; a shared network filesystem could weaken
 - Hotfix command: cd ~/Develop/Projects/opencode-goal-plugin && npm run typecheck | Expected: exit 0 | Actual: exit 0 clean | Exit: 0.
 - Hotfix command: cd ~/Develop/Projects/opencode-goal-plugin && rtk test npm test | Expected: all pass | Actual: 3 files 20 tests passed (9 existing plus 11 new) | Exit: 0.
 - Hotfix command: cd ~/Develop/Projects/opencode-goal-plugin && npm run build | Expected: ESM plus CJS plus DTS | Actual: Build success | Exit: 0.
+- Closure: git mv tasks/qa to tasks/completed | Expected: move-ok | Actual: move-ok | Exit: 0.
+- Closure commit: feature 7df40a7378d1c6d26447ab65167b2594303065e2 plus chore close commit on top via commit_and_clean_task.
 
 ## Factual Git Diff
 

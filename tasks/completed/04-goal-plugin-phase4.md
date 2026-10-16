@@ -69,6 +69,7 @@ Matrix touched local host only. Publish excluded from Night Work (needs token pl
 - Hotfix command: cd ~/Develop/Projects/opencode-goal-plugin && rtk test npm test | Expected: all pass | Actual: 11 files 74 tests passed (69 existing plus 5 new) | Exit: 0.
 - Review-fix command: typecheck plus 74 tests plus build | Expected: all exit 0 | Actual: all exit 0 | Exit: 0.
 - Review-fix command: git diff --cached --name-only | Expected: no evidence files | Actual: no evidence staged | Exit: 0.
+- Closure commit: feature 67a6e546dcd6afe9fb6d64e7d14dab14c448cc44 plus chore close commit on top via commit_and_clean_task (Night Work delegated closure).
 - Review: Code Reviewer technical approval PO_REVIEW_PENDING (F1-F6 strengths, I1-I3 publish-gated to morning). Night Work delegated closure with own commits.
 - Command: cd ~/Develop/Projects/opencode-goal-plugin && npm run build | Expected: ESM plus CJS plus DTS | Actual: Build success | Exit: 0.
 - Command: grep -R "Date.now" src | Expected: single source | Actual: only SystemClock.nowMs plus one comment | Exit: 0.
