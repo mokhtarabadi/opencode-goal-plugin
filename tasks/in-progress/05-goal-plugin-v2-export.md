@@ -26,7 +26,7 @@ Single-entry rewrite following the proven in-repo sibling pattern (smart-compact
 
 - [x] Rewrite entry to Plugin.define shape
 - [x] Typecheck plus tests plus dist schema check
-- [ ] User push plus host restart plus log verification
+- [x] User push plus host restart plus log verification
 
 ## Risk & Rollback
 
@@ -43,11 +43,9 @@ Host API drift is the risk, contained by defensive casts plus fail-closed probes
 - Command: cd ~/Develop/Projects/opencode-goal-plugin && npm run typecheck | Expected: exit 0 | Actual: exit 0 clean | Exit: 0.
 - Command: cd ~/Develop/Projects/opencode-goal-plugin && rtk test npm test | Expected: all pass | Actual: 12 files 76 tests passed (74 existing plus 2 new) | Exit: 0.
 - Command: node import dist | Expected: id plus setup function | Actual: id opencode-goal-plugin plus setup function | Exit: 0.
-- Pending: user push plus host restart plus log check.
-
-## Verification Evidence
-
-- Pending.
+- Live: user pushed, host installed fresh from git, zero load failures in new run.
+- Live: smoke test on installed copy passes shape plus command plus state plus prompt.
+- Live: work instruction fired in the user session on a real /goal call.
 
 ## Factual Git Diff
 
