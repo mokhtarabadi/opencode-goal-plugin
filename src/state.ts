@@ -6,8 +6,9 @@
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
-/** Goal lifecycle status. */
-export type GoalStatus = 'active' | 'complete' | 'blocked' | 'cleared';
+/** Goal lifecycle status. Interrupted parks a goal after a user abort. */
+export type GoalStatus =
+  'active' | 'complete' | 'blocked' | 'cleared' | 'interrupted';
 
 /** Clock abstraction to keep business logic mockable. */
 export interface Clock {
@@ -19,6 +20,26 @@ export class SystemClock implements Clock {
   nowMs(): number {
     return Date.now();
   }
+}
+
+/**
+ * Pending continuation attempt for crash and error recovery.
+ * Why this field exists: a failed or interrupted send must be retryable and
+ * survive a restart. Storing first plus last attempt time and count in file
+ * state lets the watchdog and next tick resume without double counting turns.
+ * All timestamps are UTC epoch ms from the injected Clock.
+ */
+export interface PendingAttempt {
+  /** Epoch ms of the first attempt in this retry episode. */
+  firstAttemptMs: number;
+  /** Epoch ms of the most recent attempt. */
+  lastAttemptMs: number;
+  /** How many attempts have been made in this episode. */
+  attemptCount: number;
+  /** Deadline epoch ms after which the watchdog should wake the loop. */
+  deadlineMs: number;
+  /** Last classification: provider-error or user-abort or unknown. */
+  reason: string;
 }
 
 /** Persisted goal state shape. Phase 2 adds turn tracking for the idle loop. */
@@ -49,6 +70,23 @@ export interface GoalState {
    * disk so older files still load.
    */
   wrapupSent: boolean;
+  /**
+   * Pending continuation attempt for crash and error recovery.
+   * Null when no retry is outstanding. Persisted so restart can rearm.
+   */
+  pendingAttempt: PendingAttempt | null;
+  /** Epoch ms of the last successful heartbeat turn from the injected Clock. */
+  lastHeartbeatMs: number;
+  /** Consecutive provider failures, reset on a successful turn. */
+  failureCount: number;
+  /** Monotonic epoch bumped on abort or restart to invalidate stale work. */
+  recoveryEpoch: number;
+  /**
+   * Last real session id that touched this goal.
+   * Why this field exists: startup rearm must not invent a fake session lane.
+   * Empty means unknown, so no watchdog is armed until a real event arrives.
+   */
+  lastSessionId: string;
 }
 
 export const STATE_FILENAME = 'goal-state.json';
@@ -101,6 +139,11 @@ export function initialState(
     verificationFailReason: null,
     revisionCount: 0,
     wrapupSent: false,
+    pendingAttempt: null,
+    lastHeartbeatMs: 0,
+    failureCount: 0,
+    recoveryEpoch: 0,
+    lastSessionId: '',
   };
 }
 
@@ -123,7 +166,8 @@ function isValidState(value: unknown): value is GoalState {
     v['status'] !== 'active' &&
     v['status'] !== 'complete' &&
     v['status'] !== 'blocked' &&
-    v['status'] !== 'cleared'
+    v['status'] !== 'cleared' &&
+    v['status'] !== 'interrupted'
   )
     return false;
   if (typeof v['iterationCount'] !== 'number') return false;
@@ -171,6 +215,27 @@ function isValidState(value: unknown): value is GoalState {
     return false;
   // Wrap-up flag stays optional so older files load, then normalize fills it.
   if ('wrapupSent' in v && typeof v['wrapupSent'] !== 'boolean') return false;
+  // Recovery fields stay optional so older files load, then normalize fills them.
+  if ('pendingAttempt' in v) {
+    const pa = v['pendingAttempt'];
+    if (pa !== null) {
+      if (typeof pa !== 'object') return false;
+      const p = pa as Record<string, unknown>;
+      if (typeof p['firstAttemptMs'] !== 'number') return false;
+      if (typeof p['lastAttemptMs'] !== 'number') return false;
+      if (typeof p['attemptCount'] !== 'number') return false;
+      if (typeof p['deadlineMs'] !== 'number') return false;
+      if (typeof p['reason'] !== 'string') return false;
+    }
+  }
+  if ('lastHeartbeatMs' in v && typeof v['lastHeartbeatMs'] !== 'number')
+    return false;
+  if ('failureCount' in v && typeof v['failureCount'] !== 'number')
+    return false;
+  if ('recoveryEpoch' in v && typeof v['recoveryEpoch'] !== 'number')
+    return false;
+  if ('lastSessionId' in v && typeof v['lastSessionId'] !== 'string')
+    return false;
   return true;
 }
 
@@ -192,6 +257,58 @@ export function normalizeState(input: GoalState): GoalState {
     verificationFailReason: input.verificationFailReason ?? null,
     revisionCount: input.revisionCount ?? 0,
     wrapupSent: typeof wrap === 'boolean' ? wrap : false,
+    pendingAttempt: normalizePendingAttempt(
+      (input as unknown as { pendingAttempt?: unknown }).pendingAttempt,
+    ),
+    lastHeartbeatMs:
+      typeof (input as unknown as { lastHeartbeatMs?: unknown })
+        .lastHeartbeatMs === 'number'
+        ? ((input as unknown as { lastHeartbeatMs: number })
+            .lastHeartbeatMs as number)
+        : 0,
+    failureCount:
+      typeof (input as unknown as { failureCount?: unknown }).failureCount ===
+      'number'
+        ? ((input as unknown as { failureCount: number })
+            .failureCount as number)
+        : 0,
+    recoveryEpoch:
+      typeof (input as unknown as { recoveryEpoch?: unknown }).recoveryEpoch ===
+      'number'
+        ? ((input as unknown as { recoveryEpoch: number })
+            .recoveryEpoch as number)
+        : 0,
+    lastSessionId:
+      typeof (input as unknown as { lastSessionId?: unknown }).lastSessionId ===
+      'string'
+        ? ((input as unknown as { lastSessionId: string })
+            .lastSessionId as string)
+        : '',
+  };
+}
+
+/**
+ * Normalize a possibly-missing pendingAttempt field from an older file.
+ * Why this helper exists: normalizeState needs a total conversion without
+ * crashing on undefined, null, or a partial object from disk.
+ * @param raw unknown pendingAttempt value
+ */
+function normalizePendingAttempt(raw: unknown): PendingAttempt | null {
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw !== 'object') return null;
+  const p = raw as Record<string, unknown>;
+  // Every field is required: a partial record is dropped, not trusted.
+  if (typeof p['firstAttemptMs'] !== 'number') return null;
+  if (typeof p['lastAttemptMs'] !== 'number') return null;
+  if (typeof p['attemptCount'] !== 'number') return null;
+  if (typeof p['deadlineMs'] !== 'number') return null;
+  if (typeof p['reason'] !== 'string') return null;
+  return {
+    firstAttemptMs: p['firstAttemptMs'],
+    lastAttemptMs: p['lastAttemptMs'],
+    attemptCount: p['attemptCount'],
+    deadlineMs: p['deadlineMs'],
+    reason: p['reason'],
   };
 }
 

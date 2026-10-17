@@ -21,10 +21,15 @@ import {
   completeGoal,
   parseGoalCommand,
   setObjective,
+  resumeGoal,
   isSafeGoalTitle,
   GoalInputSchema,
 } from './goal.js';
-import { handleSessionIdle } from './loop.js';
+import {
+  handleSessionIdle,
+  handleSessionFailure,
+  classifyFailure,
+} from './loop.js';
 import { DEFAULT_LIMITS, STOP_FILE_NAME } from './limits.js';
 import type { Limits } from './limits.js';
 import {
@@ -35,6 +40,12 @@ import {
 } from './compaction.js';
 import { saveEvidence, emptyEvidence, loadEvidence } from './evidence.js';
 import { tryCompleteWithEvidence } from './verifier.js';
+import {
+  armWatchdog,
+  clearWatchdog,
+  rearmFromState,
+  _resetWatchdogsForTests,
+} from './watchdog.js';
 
 /**
  * V2 contract note: file-state at .opencode/goal-state.json owns truth.
@@ -204,6 +215,23 @@ export async function handleGoalCommand(
       return 'Failed to save goal state: ' + (err as Error).message;
     }
     return 'Goal marked complete.';
+  }
+  if (parsed.kind === 'resume') {
+    // Resume a parked goal back to active after an explicit user request.
+    let resumed: GoalState;
+    try {
+      resumed = resumeGoal(current, clock);
+    } catch {
+      return (
+        'Only a parked goal can resume. Current status: ' + current.status + '.'
+      );
+    }
+    try {
+      await saveGoalState(statePath, resumed);
+    } catch (err) {
+      return 'Failed to save goal state: ' + (err as Error).message;
+    }
+    return 'Goal resumed: ' + resumed.objective;
   }
   const cleared = clearGoal(current, clock);
   try {
@@ -428,7 +456,8 @@ export function buildGoalWorkInstruction(
     ').\n' +
     'Work toward it now with concrete steps.\n' +
     'When done, finish with evidence and call /goal complete. ' +
-    'If blocked, call /goal block <reason>. To cancel, call /goal clear.'
+    'If blocked, call /goal block <reason>. To cancel, call /goal clear. ' +
+    'If the goal was parked, call /goal resume to continue.'
   );
 }
 
@@ -625,6 +654,88 @@ export default Plugin.define({
     const controller = new AbortController();
     const idleAbortControllers = new Set<AbortController>();
     idleAbortControllers.add(controller);
+    // Shared deps builder so idle ticks, failure rearms, and startup resume all
+    // use one sender. Why one builder: a second copy could drift and let a wake
+    // or a retry send twice under the same lane.
+    const buildIdleDeps = (rawID: string) => {
+      const session = (
+        ctx as { session?: { prompt?: (a: unknown) => Promise<unknown> } }
+      ).session;
+      const promptFn =
+        session !== undefined && typeof session.prompt === 'function'
+          ? session.prompt.bind(session)
+          : null;
+      return {
+        clock,
+        limits: DEFAULT_LIMITS,
+        ownerId,
+        loadState: loadGoalState,
+        saveState: saveGoalState,
+        tryClaim: tryClaimLease,
+        sendPrompt: async (prompt: string) => {
+          // Real failures stay failures: never synthesize a fake success.
+          // A thrown send or an empty message id becomes a retryable result.
+          if (promptFn === null) {
+            return {
+              success: false as const,
+              error: 'no-prompt-fn',
+              retryable: true,
+            };
+          }
+          try {
+            const res = (await promptFn({
+              sessionID: rawID,
+              text: prompt,
+            })) as {
+              messageID?: unknown;
+              tokenSpend?: unknown;
+            } | null;
+            const messageID =
+              typeof res?.messageID === 'string' && res.messageID.length > 0
+                ? res.messageID
+                : '';
+            if (messageID === '') {
+              return {
+                success: false as const,
+                error: 'empty-message-id',
+                retryable: true,
+              };
+            }
+            const tokenSpend =
+              typeof res?.tokenSpend === 'number' ? res.tokenSpend : 0;
+            return { success: true as const, messageId: messageID, tokenSpend };
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            // An abort must not be retried: mark it non-retryable so the loop
+            // parks the goal instead of arming a watchdog against a user stop.
+            const kind = classifyFailure(err);
+            return {
+              success: false as const,
+              error: msg,
+              retryable: kind !== 'user-abort',
+            };
+          }
+        },
+        hasStopFile,
+        // Settle hook: success clears the watchdog, failure re-arms it.
+        onTurnSettled: (r: { ok: boolean; deadlineMs: number | null }) => {
+          try {
+            if (r.ok || r.deadlineMs === null) {
+              clearWatchdog(projectDir, rawID);
+              return;
+            }
+            armWatchdog(projectDir, rawID, r.deadlineMs, clock, async () => {
+              await handleSessionIdle(
+                { projectDir, lastMessageId: null, sessionId: rawID },
+                buildIdleDeps(rawID),
+              );
+            });
+          } catch {
+            // Watchdog bookkeeping is best-effort.
+          }
+        },
+      };
+    };
     const idleTask = (async () => {
       try {
         const events = (
@@ -644,46 +755,74 @@ export default Plugin.define({
         for await (const event of stream) {
           try {
             if (event === null || typeof event !== 'object') continue;
-            if ((event as { type?: unknown }).type !== 'session.idle') continue;
+            const evType = (event as { type?: unknown }).type;
             const data = (event as { data?: { sessionID?: unknown } }).data;
             const props = (event as { properties?: { sessionID?: unknown } })
               .properties;
+            // Failure events (error / execution.failed / execution.interrupted)
+            // are the crash-and-abort signal: classify and park or mark retry.
+            if (
+              evType === 'session.error' ||
+              evType === 'session.execution.failed' ||
+              evType === 'session.execution.interrupted'
+            ) {
+              const failID = data?.sessionID ?? props?.sessionID;
+              if (typeof failID !== 'string' || failID.length === 0) continue;
+              const errPayload =
+                (event as { error?: unknown }).error ??
+                (
+                  event as {
+                    properties?: { error?: unknown };
+                    data?: { error?: unknown };
+                  }
+                ).properties?.error ??
+                (event as { data?: { error?: unknown } }).data?.error ??
+                evType;
+              await handleSessionFailure(
+                { projectDir, sessionId: failID },
+                {
+                  clock,
+                  loadState: loadGoalState,
+                  saveState: saveGoalState,
+                  tryClaim: tryClaimLease,
+                  ownerId,
+                },
+                errPayload,
+                typeof evType === 'string' ? evType : undefined,
+              );
+              // Re-arm the watchdog from the persisted attempt so a retryable
+              // provider error wakes the loop even when no idle event follows.
+              void loadGoalState(resolveStatePath(projectDir))
+                .then((st) => {
+                  if (st === null) return;
+                  rearmFromState(projectDir, failID, st, clock, async () => {
+                    await handleSessionIdle(
+                      { projectDir, lastMessageId: null, sessionId: failID },
+                      buildIdleDeps(failID),
+                    );
+                  });
+                })
+                .catch(() => undefined);
+              continue;
+            }
+            if (evType !== 'session.idle') continue;
             const rawID = data?.sessionID ?? props?.sessionID;
             if (typeof rawID !== 'string' || rawID.length === 0) continue;
-            const session = (
-              ctx as { session?: { prompt?: (a: unknown) => Promise<unknown> } }
-            ).session;
-            if (session === undefined || typeof session.prompt !== 'function')
-              continue;
-            const promptFn = session.prompt.bind(session);
-            const deps = {
-              clock,
-              limits: DEFAULT_LIMITS,
-              ownerId,
-              loadState: loadGoalState,
-              saveState: saveGoalState,
-              tryClaim: tryClaimLease,
-              sendPrompt: async (prompt: string) => {
-                const res = (await promptFn({
-                  sessionID: rawID,
-                  text: prompt,
-                }).catch(() => null)) as {
-                  messageID?: unknown;
-                  tokenSpend?: unknown;
-                } | null;
-                const messageID =
-                  typeof res?.messageID === 'string' && res.messageID.length > 0
-                    ? res.messageID
-                    : 'turn-unlabeled';
-                const tokenSpend =
-                  typeof res?.tokenSpend === 'number' ? res.tokenSpend : 0;
-                return { messageId: messageID, tokenSpend };
-              },
-              hasStopFile,
-            };
+            // Thread the real last message id so the human-message yield works.
+            // Falling back to null only when the host omits it.
+            const lastMsgId =
+              (props as { lastMessageID?: unknown } | undefined)
+                ?.lastMessageID ??
+              (data as { lastMessageID?: unknown } | undefined)
+                ?.lastMessageID ??
+              null;
             await handleSessionIdle(
-              { projectDir, lastMessageId: null, sessionId: rawID },
-              deps,
+              {
+                projectDir,
+                lastMessageId: typeof lastMsgId === 'string' ? lastMsgId : null,
+                sessionId: rawID,
+              },
+              buildIdleDeps(rawID),
             );
           } catch {
             // One bad tick never kills the subscription.
@@ -693,6 +832,29 @@ export default Plugin.define({
         // Stream end or abort: quiet exit.
       }
     })();
+
+    // Session-start resume: rearm any outstanding retry from file state.
+    // Why no immediate send: a blind resume would bypass the lease and the
+    // 20s cooldown. Rearm only, so the watchdog performs the guarded retry.
+    void loadGoalState(resolveStatePath(projectDir))
+      .then((st) => {
+        if (st === null || st.status !== 'active') return;
+        if (st.pendingAttempt === null) return;
+        // Rearm the exact last real session. A missing id means no lane is
+        // known yet, so skip: the next real event will rearm correctly.
+        const lane =
+          typeof st.lastSessionId === 'string' && st.lastSessionId.length > 0
+            ? st.lastSessionId
+            : '';
+        if (lane === '') return;
+        rearmFromState(projectDir, lane, st, clock, async () => {
+          await handleSessionIdle(
+            { projectDir, lastMessageId: null, sessionId: lane },
+            buildIdleDeps(lane),
+          );
+        });
+      })
+      .catch(() => undefined);
 
     // Compaction survival: re-inject the goal summary from file state, never send.
     try {

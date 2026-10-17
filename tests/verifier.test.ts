@@ -79,7 +79,9 @@ describe('verifier', () => {
   it('T3 subagent pass completes', async () => {
     // Host subagent agrees with local checks: completion carries both reasons.
     const d = proj({ 'src/a.ts': 'x' });
-    const host = { runSubagent: async () => ({ pass: true, reason: 'looks good' }) };
+    const host = {
+      runSubagent: async () => ({ pass: true, reason: 'looks good' }),
+    };
     const got = await verifyCompletion({
       projectDir: d,
       evidence: {
@@ -104,7 +106,9 @@ describe('verifier', () => {
   it('T4 subagent fail keeps goal active', async () => {
     // Host subagent rejects: goal stays active with the fail reason.
     const d = proj({ 'src/a.ts': 'x' });
-    const host = { runSubagent: async () => ({ pass: false, reason: 'tests not run here' }) };
+    const host = {
+      runSubagent: async () => ({ pass: false, reason: 'tests not run here' }),
+    };
     const got = await verifyCompletion({
       projectDir: d,
       evidence: {
@@ -169,6 +173,8 @@ describe('verifier', () => {
       ],
     });
     expect(got.ok).toBe(false);
-    expect(got.failures.some((f) => f.startsWith('traversal-escape'))).toBe(true);
+    expect(got.failures.some((f) => f.startsWith('traversal-escape'))).toBe(
+      true,
+    );
   });
 });

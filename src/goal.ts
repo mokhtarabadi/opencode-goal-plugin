@@ -13,6 +13,7 @@ export type ParsedGoal =
   | { kind: 'clear' }
   | { kind: 'block'; reason: string }
   | { kind: 'complete' }
+  | { kind: 'resume' }
   | { kind: 'invalid'; raw: string };
 
 export const MAX_OBJECTIVE_LEN = 2000;
@@ -75,6 +76,14 @@ export function parseGoalCommand(rawInput: string): ParsedGoal {
     bodyLower.startsWith('complete ') ||
     bodyLower.startsWith('complete\t') ||
     bodyLower.startsWith('complete\n')
+  ) {
+    return { kind: 'invalid', raw: rawInput };
+  }
+  if (bodyLower === 'resume') return { kind: 'resume' };
+  if (
+    bodyLower.startsWith('resume ') ||
+    bodyLower.startsWith('resume\t') ||
+    bodyLower.startsWith('resume\n')
   ) {
     return { kind: 'invalid', raw: rawInput };
   }
@@ -216,6 +225,30 @@ export function clearGoal(current: GoalState, clock: Clock): GoalState {
   return {
     ...current,
     status: 'cleared',
+    leaseOwner: null,
+    leaseExpiresAtMs: 0,
+    updatedAtMs: clock.nowMs(),
+  };
+}
+
+/**
+ * Resume a parked goal back to active after an explicit user request.
+ * Why this exists: a user abort parks the goal as interrupted, and the only
+ * path back is an explicit /goal resume. Blocked goals can also be resumed.
+ * Clears any stale retry so the watchdog does not fire against a fresh start.
+ * @param current current state, must be interrupted or blocked
+ * @param clock injected clock
+ */
+export function resumeGoal(current: GoalState, clock: Clock): GoalState {
+  // Only a parked goal can resume; active and finished states are no-ops.
+  if (current.status !== 'interrupted' && current.status !== 'blocked') {
+    throw new Error('only a parked goal can resume');
+  }
+  return {
+    ...current,
+    status: 'active',
+    pendingAttempt: null,
+    recoveryEpoch: current.recoveryEpoch + 1,
     leaseOwner: null,
     leaseExpiresAtMs: 0,
     updatedAtMs: clock.nowMs(),

@@ -146,7 +146,7 @@ describe('H1-H4 integration proofs', () => {
     const second = await tryClaimLease(sp, 'holder-B', LEASE_TTL_MS, clock);
     expect(second.claimed).toBe(false);
   });
-  it('wrapup flips once on budget hit then stays silent', async () => {
+  it('wrapup sends once on budget hit then stays silent', async () => {
     const { handleSessionIdle, _resetIdleInFlightForTests } =
       await import('../src/loop.js');
     const { initialState } = await import('../src/state.js');
@@ -164,6 +164,7 @@ describe('H1-H4 integration proofs', () => {
       wrapupSent: false,
     };
     const store = { state: base as typeof base | null };
+    const sent: string[] = [];
     let saves = 0;
     const deps = {
       clock,
@@ -174,8 +175,12 @@ describe('H1-H4 integration proofs', () => {
         saves += 1;
         store.state = s;
       },
-      tryClaim: async () => ({ claimed: false, state: store.state }),
-      sendPrompt: async () => ({ messageId: 'm1' }),
+      // Claim succeeds so the one-time wrap send actually fires.
+      tryClaim: async () => ({ claimed: true, state: store.state }),
+      sendPrompt: async (p: string) => {
+        sent.push(p);
+        return { success: true as const, messageId: 'wrap-1' };
+      },
       hasStopFile: async () => false,
     };
     const first = await handleSessionIdle(
@@ -184,12 +189,16 @@ describe('H1-H4 integration proofs', () => {
     );
     expect(first.reason).toBe('max-turns');
     expect(store.state?.wrapupSent).toBe(true);
+    expect(sent.length).toBe(1);
+    expect(sent[0]).toContain('budget reached');
     const savesAfterFirst = saves;
     const second = await handleSessionIdle(
       { projectDir: '/tmp/wrap1', lastMessageId: null },
       deps as never,
     );
-    expect(second.reason).toBe('max-turns');
+    // Wrapped-up is terminal: no second wrap send, no extra save.
+    expect(second.reason).toBe('wrapped-up');
+    expect(sent.length).toBe(1);
     expect(saves).toBe(savesAfterFirst);
   });
   it('two loop ticks same project different sessions both send', async () => {

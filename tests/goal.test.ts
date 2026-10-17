@@ -28,6 +28,7 @@ describe('parseGoalCommand', () => {
     expect(parseGoalCommand('/goal status')).toEqual({ kind: 'status' });
     expect(parseGoalCommand('/goal clear')).toEqual({ kind: 'clear' });
     expect(parseGoalCommand('/goal complete')).toEqual({ kind: 'complete' });
+    expect(parseGoalCommand('/goal resume')).toEqual({ kind: 'resume' });
   });
   it('rejects empty and overlong', () => {
     expect(parseGoalCommand('/goal   ').kind).toBe('invalid');

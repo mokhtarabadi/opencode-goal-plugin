@@ -10,9 +10,14 @@ All notable changes follow Keep a Changelog.
 - Fail-closed lease with token single-flight plus per-session cooldown fairness.
 - Evidence-gated complete helper plus wrap-up flag plus context nudge injection.
 - V2 strictness with goal input JSON Schema plus traversal-safe title check.
+- Crash recovery: session.error plus execution.failed listeners, classifyFailure, 90s watchdog, session-start rearm, retryable send, persisted pendingAttempt.
 ### Fixed
 - Host-native V2 export: default is Plugin.define with id plus setup wiring slash goal plus idle plus compaction.
 - ESM-only dist because the plugin package ships no require entry.
+- Swallowed send no longer fakes a turn: a failed send stays retryable and records pendingAttempt.
+- Active goal no longer stalls when no session.idle arrives: watchdog plus error listener plus resume.
+- Hotfix: lease-guarded failure write plus abort-aware send plus real startup lane plus wrap-after-success plus watchdog bounds plus /goal resume.
+- Hotfix: failed-send lane persistence plus wrap watchdog settle plus pending undefined guard.
 - Hotfix idle survival: compaction keeps live controller, stale entries cleared.
 - Hotfix evidence wiring: both complete lanes require proof plus wrapupSent once.
 - Hotfix setup guard plus session fairness plus lease proof with sidecar.

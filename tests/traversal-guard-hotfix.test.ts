@@ -30,11 +30,20 @@ describe('traversal guard hotfix', () => {
       version: 1,
       updatedAtMs: 1,
       criteria: [
-        { id: 'c1', claim: 'x', files: ['', 'src', 'src/a.ts'], tests: [{ command: 'npm test', exitCode: 0 }] },
+        {
+          id: 'c1',
+          claim: 'x',
+          files: ['', 'src', 'src/a.ts'],
+          tests: [{ command: 'npm test', exitCode: 0 }],
+        },
       ],
     });
     expect(got.ok).toBe(false);
-    expect(got.failures.some((x) => x.includes('traversal-escape') || x.includes('not-a-file'))).toBe(true);
+    expect(
+      got.failures.some(
+        (x) => x.includes('traversal-escape') || x.includes('not-a-file'),
+      ),
+    ).toBe(true);
   });
   it('verifyLocal with null file fails closed', async () => {
     const dir2 = await fs.mkdtemp(path.join(os.tmpdir(), 'goal-verify-null-'));
@@ -46,7 +55,12 @@ describe('traversal guard hotfix', () => {
           version: 1,
           updatedAtMs: 1,
           criteria: [
-            { id: 'c1', claim: 'x', files: [null as unknown as string], tests: [{ command: 'npm test', exitCode: 0 }] },
+            {
+              id: 'c1',
+              claim: 'x',
+              files: [null as unknown as string],
+              tests: [{ command: 'npm test', exitCode: 0 }],
+            },
           ],
         });
       })(),

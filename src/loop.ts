@@ -67,6 +67,11 @@ export interface IdleContext {
   sessionId?: string | null;
 }
 
+/** Discriminated result of one send attempt. */
+export type SendResult =
+  | { success: true; messageId: string; tokenSpend?: number }
+  | { success: false; error: string; retryable: boolean };
+
 /** Injected collaborators so tests never touch disk or model. */
 export interface IdleDeps {
   clock: Clock;
@@ -80,10 +85,63 @@ export interface IdleDeps {
     ttl: number,
     c: Clock,
   ) => Promise<{ claimed: boolean; state: GoalState | null }>;
+  /**
+   * Send one continuation prompt.
+   * Return shape is tolerant: an object with success true carries messageId,
+   * success false carries error plus retryable. A legacy plain
+   * { messageId } return is treated as success when the id is non-empty.
+   */
   sendPrompt: (
     prompt: string,
-  ) => Promise<{ messageId: string; tokenSpend?: number }>;
+  ) => Promise<SendResult | { messageId: string; tokenSpend?: number }>;
   hasStopFile: () => Promise<boolean>;
+  /**
+   * Optional hook fired after a turn ends, success or failure.
+   * Why this exists: the host clears the watchdog on success and re-arms it on
+   * a failure without the pure loop depending on timer state.
+   */
+  onTurnSettled?: (result: { ok: boolean; deadlineMs: number | null }) => void;
+}
+
+/**
+ * Normalize a raw send result into a discriminated SendResult.
+ * Why this helper exists: older tests and hosts return a plain
+ * { messageId } object. A missing or empty id means failure, never a
+ * synthesized turn label, so a failed send stays retryable.
+ * @param raw unknown result from the host sender
+ */
+export function normalizeSendResult(raw: unknown): SendResult {
+  if (raw !== null && typeof raw === 'object') {
+    const r = raw as Record<string, unknown>;
+    if ('success' in r) {
+      if (
+        r['success'] === true &&
+        typeof r['messageId'] === 'string' &&
+        r['messageId'].length > 0
+      ) {
+        return {
+          success: true,
+          messageId: r['messageId'],
+          tokenSpend: typeof r['tokenSpend'] === 'number' ? r['tokenSpend'] : 0,
+        };
+      }
+      return {
+        success: false,
+        error: typeof r['error'] === 'string' ? r['error'] : 'send-failed',
+        retryable: r['retryable'] !== false,
+      };
+    }
+    // Legacy shape: non-empty messageId counts as success.
+    if (typeof r['messageId'] === 'string' && r['messageId'].length > 0) {
+      return {
+        success: true,
+        messageId: r['messageId'],
+        tokenSpend: typeof r['tokenSpend'] === 'number' ? r['tokenSpend'] : 0,
+      };
+    }
+  }
+  // Anything else is a retryable failure, never a fake success.
+  return { success: false, error: 'send-failed', retryable: true };
 }
 
 /** Idle tick outcome. */
@@ -100,6 +158,293 @@ export interface IdleDecision {
  */
 function safeSpend(v: unknown): number {
   return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0;
+}
+
+/**
+ * Default watchdog deadline: wake before the 120s lease TTL expires.
+ * Why 90s exists: a wake sooner than the lease grants a clean claim while a
+ * wake later than TTL would let another process reclaim first.
+ */
+export const DEFAULT_MAX_TURN_MS = 90000;
+
+/**
+ * Build or extend a pending continuation attempt after a failed turn.
+ * Why this helper exists: retry state must be explicit and persisted so the
+ * watchdog and a restart can resume. Timestamps come from the injected clock.
+ * @param state current goal state carrying any prior attempt
+ * @param reason failure classification (provider-error or user-abort)
+ * @param nowMs injected now in epoch ms
+ */
+export function buildPendingAttempt(
+  state: GoalState,
+  reason: string,
+  nowMs: number,
+): import('./state.js').PendingAttempt {
+  // Continue an existing episode when present, else start a fresh one.
+  // Loose null check covers an undefined value from a raw disk read.
+  const prev = state.pendingAttempt;
+  const hasPrev = prev !== null && prev !== undefined;
+  return {
+    firstAttemptMs: hasPrev ? prev.firstAttemptMs : nowMs,
+    lastAttemptMs: nowMs,
+    attemptCount: hasPrev ? prev.attemptCount + 1 : 1,
+    deadlineMs: nowMs + DEFAULT_MAX_TURN_MS,
+    reason,
+  };
+}
+
+/** Failure classification for crash-versus-abort decisions. */
+export type FailureKind = 'user-abort' | 'provider-error'; /**
+ * Classify a failure payload as a user abort or a retryable provider error.
+ * Why this helper exists: an explicit user abort must park the goal and
+ * require a manual resume, while a transient provider error should retry.
+ * Precedence: an exact MessageAbortedError name or an explicit abort phrase
+ * wins; otherwise the event type hint decides (interrupted means the user
+ * stopped, failed means a provider error); otherwise provider-error.
+ * Pure and total so callers never throw on a weird error shape.
+ * @param err unknown error name or payload
+ * @param evType optional host event type hint
+ */
+export function classifyFailure(err: unknown, evType?: string): FailureKind {
+  // Build one lowercase match string from the common error shapes.
+  let name = '';
+  let message = '';
+  if (typeof err === 'string') {
+    message = err;
+  } else if (err !== null && typeof err === 'object') {
+    const e = err as { name?: unknown; message?: unknown; type?: unknown };
+    if (typeof e.name === 'string') name = e.name;
+    if (typeof e.message === 'string') message = e.message;
+    // Some hosts put the error name on `type`.
+    if (name === '' && typeof e.type === 'string') name = e.type;
+  }
+  const low = (name + ' ' + message).toLowerCase();
+  // Exact abort names win without needing an event hint.
+  if (low.includes('messageabortederror')) return 'user-abort';
+  // An explicit user stop phrase must not be overridden by an event hint.
+  if (low.includes('user abort') || low.includes('aborted by user')) {
+    return 'user-abort';
+  }
+  // A bare "aborted" alone is ambiguous: a transport can abort too, so it only
+  // counts as an abort when the event hint also says interrupted.
+  if (evType === 'session.execution.interrupted') return 'user-abort';
+  if (
+    low.includes('aborted') ||
+    low.includes('canceled') ||
+    low.includes('cancelled')
+  ) {
+    // Without an interrupted hint, treat a bare abort word as a provider error.
+    return 'provider-error';
+  }
+  // Everything else (timeout, network, 5xx, transport, provider) is retryable.
+  return 'provider-error';
+}
+
+/**
+ * Handle one session failure event: classify and either park or mark retry.
+ * Why this function exists: a failed or interrupted turn must not stall an
+ * active goal silently. A user abort parks the goal and requires a manual
+ * resume; a provider error records a retry attempt for the watchdog.
+ * @param ctx project dir plus session id
+ * @param deps injected clock plus storage
+ * @param err the failure payload from the host event
+ */
+export async function handleSessionFailure(
+  ctx: { projectDir: string; sessionId?: string | null },
+  deps: {
+    clock: Clock;
+    loadState: (p: string) => Promise<GoalState | null>;
+    saveState: (p: string, s: GoalState) => Promise<void>;
+    /** Lease claim so a failure write never races an idle tick. */
+    tryClaim?: (
+      p: string,
+      owner: string,
+      ttl: number,
+      c: Clock,
+    ) => Promise<{ claimed: boolean; state: GoalState | null }>;
+    ownerId?: string;
+  },
+  err: unknown,
+  evType?: string,
+): Promise<IdleDecision> {
+  // Null guards: a host with an empty payload gets a reason, never a throw.
+  if (ctx === null || typeof ctx !== 'object') {
+    return { decision: 'stopped', reason: 'invalid-context' };
+  }
+  if (
+    typeof ctx.projectDir !== 'string' ||
+    ctx.projectDir.trim().length === 0
+  ) {
+    return { decision: 'stopped', reason: 'invalid-project-dir' };
+  }
+  if (
+    deps === null ||
+    typeof deps !== 'object' ||
+    typeof deps.loadState !== 'function' ||
+    typeof deps.saveState !== 'function'
+  ) {
+    return { decision: 'stopped', reason: 'invalid-deps' };
+  }
+  if (
+    deps.clock === null ||
+    typeof deps.clock !== 'object' ||
+    typeof deps.clock.nowMs !== 'function'
+  ) {
+    return { decision: 'stopped', reason: 'invalid-deps' };
+  }
+  const statePath = resolveStatePath(ctx.projectDir);
+  let current: GoalState | null;
+  try {
+    current = await deps.loadState(statePath);
+  } catch {
+    return { decision: 'stopped', reason: 'corrupt-state' };
+  }
+  // No goal or a finished goal: nothing to recover, exit quietly.
+  if (current === null) return { decision: 'skipped', reason: 'no-state' };
+  if (current.status !== 'active') {
+    return { decision: 'skipped', reason: 'stopped-' + current.status };
+  }
+  // Claim the lease before any failure write so it cannot race an idle tick.
+  // Why required: a blind read-modify-write could clear a held lease or lose
+  // a failureCount increment. Without a claimer the caller opted out of it.
+  if (typeof deps.tryClaim === 'function') {
+    let claimed = false;
+    try {
+      const res = await deps.tryClaim(
+        statePath,
+        deps.ownerId ?? 'failure',
+        LEASE_TTL_MS,
+        deps.clock,
+      );
+      claimed = res.claimed;
+      if (res.state !== null) current = res.state;
+    } catch {
+      return { decision: 'stopped', reason: 'claim-failed' };
+    }
+    if (!claimed) return { decision: 'skipped', reason: 'lease-held' };
+  }
+  const now = deps.clock.nowMs();
+  const kind = classifyFailure(err, evType);
+  const sessionId =
+    typeof ctx.sessionId === 'string' && ctx.sessionId.length > 0
+      ? ctx.sessionId
+      : current.lastSessionId;
+  if (kind === 'user-abort') {
+    // Park the goal: an explicit abort must never be auto-resumed.
+    try {
+      await deps.saveState(statePath, {
+        ...current,
+        status: 'interrupted',
+        pendingAttempt: null,
+        recoveryEpoch: current.recoveryEpoch + 1,
+        lastSessionId: sessionId,
+        leaseOwner: null,
+        leaseExpiresAtMs: 0,
+        updatedAtMs: now,
+      });
+    } catch {
+      return { decision: 'stopped', reason: 'save-failed' };
+    }
+    return { decision: 'stopped', reason: 'user-abort-parked' };
+  }
+  // Provider error: record a retry attempt and let the watchdog wake the loop.
+  try {
+    await deps.saveState(statePath, {
+      ...current,
+      pendingAttempt: buildPendingAttempt(current, 'provider-error', now),
+      failureCount: current.failureCount + 1,
+      recoveryEpoch: current.recoveryEpoch + 1,
+      lastSessionId: sessionId,
+      leaseOwner: null,
+      leaseExpiresAtMs: 0,
+      updatedAtMs: now,
+    });
+  } catch {
+    return { decision: 'stopped', reason: 'save-failed' };
+  }
+  return { decision: 'skipped', reason: 'provider-error-retry' };
+}
+
+/**
+ * Settle a failed send: park on a user abort, else record a retry attempt.
+ * Why this helper exists: both the thrown and the non-retryable paths share
+ * one recovery policy, so the classification cannot drift between them.
+ * @param statePath absolute goal state path
+ * @param state the state at claim time
+ * @param deps injected deps (clock, saveState, onTurnSettled)
+ * @param kind failure classification
+ */
+async function settleFailedSend(
+  statePath: string,
+  state: GoalState,
+  deps: IdleDeps,
+  kind: FailureKind,
+  sessionId: string,
+): Promise<IdleDecision> {
+  const now = deps.clock.nowMs();
+  if (kind === 'user-abort') {
+    // Park: an explicit abort must never be auto-retried.
+    try {
+      await deps.saveState(statePath, {
+        ...state,
+        status: 'interrupted',
+        pendingAttempt: null,
+        recoveryEpoch: state.recoveryEpoch + 1,
+        lastSessionId: sessionId,
+        leaseOwner: null,
+        leaseExpiresAtMs: 0,
+        updatedAtMs: now,
+      });
+    } catch {
+      return { decision: 'stopped', reason: 'save-failed' };
+    }
+    try {
+      deps.onTurnSettled?.({ ok: true, deadlineMs: null });
+    } catch {
+      // Settle hook is best-effort.
+    }
+    return { decision: 'stopped', reason: 'user-abort-parked' };
+  }
+  const pending = buildPendingAttempt(state, 'provider-error', now);
+  try {
+    await deps.saveState(statePath, {
+      ...state,
+      pendingAttempt: pending,
+      failureCount: state.failureCount + 1,
+      // Persist the real lane so a restart can rearm the watchdog.
+      lastSessionId: sessionId,
+      leaseOwner: null,
+      leaseExpiresAtMs: 0,
+      updatedAtMs: now,
+    });
+  } catch {
+    // Cleanup failure keeps the send failure as the reported reason.
+  }
+  try {
+    deps.onTurnSettled?.({ ok: false, deadlineMs: pending.deadlineMs });
+  } catch {
+    // Settle hook is best-effort.
+  }
+  return { decision: 'stopped', reason: 'send-failed' };
+}
+
+/**
+ * Build the one-time wrap-up prompt sent when a budget is exhausted.
+ * Why this exists: the loop must tell the agent to stop cleanly instead of
+ * dying silently. Sent at most once, then the persisted flag blocks re-entry.
+ * @param state active goal state
+ * @param reason the budget reason that tripped (max-turns or wall-time)
+ */
+export function buildWrapupPrompt(state: GoalState, reason: string): string {
+  return (
+    'Goal budget reached (' +
+    reason +
+    ') for "' +
+    state.objective +
+    '".\n' +
+    'Stop starting new work. Summarize what is done with evidence and finish now.\n' +
+    'If the objective is met call /goal complete. Otherwise call /goal block <reason>.'
+  );
 }
 
 /**
@@ -120,6 +465,8 @@ export function shouldContinue(
   if (state === null) return { ok: false, reason: 'no-state' };
   if (state.status !== 'active')
     return { ok: false, reason: 'stopped-' + state.status };
+  // A sent wrap-up is terminal: never send a second one after the budget hit.
+  if (state.wrapupSent === true) return { ok: false, reason: 'wrapped-up' };
   // Verification in flight pauses auto turns without stopping the goal.
   if (state.pendingVerification === true)
     return { ok: false, reason: 'verification-pending' };
@@ -312,24 +659,89 @@ export async function handleSessionIdle(
         gate.reason.startsWith('stopped-') ||
         gate.reason === 'max-turns' ||
         gate.reason === 'wall-time' ||
+        gate.reason === 'wrapped-up' ||
         gate.reason === 'stop-file';
-      // Wrap-up-once bookkeeping: first budget hit flips wrapupSent true.
-      // Why save here exists: exactly one final marker survives restarts.
-      // Second hit becomes no-op without extra writes. Best-effort only.
+      // Wrap-up-once: on the first budget hit send one final wrap prompt, mark
+      // the persisted flag, then every later hit stops without another send.
       if (
         (gate.reason === 'max-turns' || gate.reason === 'wall-time') &&
         current !== null &&
         (current as GoalState).wrapupSent !== true
       ) {
+        const cur = current as GoalState;
+        // Claim the lease so the wrap send stays single-flight like any turn.
+        let wrapClaimed: { claimed: boolean; state: GoalState | null } | null =
+          null;
+        try {
+          wrapClaimed = await deps.tryClaim(
+            statePath,
+            deps.ownerId,
+            LEASE_TTL_MS,
+            deps.clock,
+          );
+        } catch {
+          wrapClaimed = null;
+        }
+        // Lease not held: skip this tick without flipping the flag so the wrap
+        // can still be sent later. A lost lease must not consume the one wrap.
+        if (wrapClaimed === null || !wrapClaimed.claimed) {
+          return { decision: 'skipped', reason: 'lease-held' };
+        }
+        let wrapOk = false;
+        try {
+          const raw = await deps.sendPrompt(
+            buildWrapupPrompt(cur, gate.reason),
+          );
+          wrapOk = normalizeSendResult(raw).success;
+        } catch {
+          // A thrown wrap send is a failure: do not flip the flag.
+          wrapOk = false;
+        }
+        // Only a real successful wrap marks the goal wrapped.
+        if (wrapOk) {
+          try {
+            await deps.saveState(statePath, {
+              ...cur,
+              wrapupSent: true,
+              leaseOwner: null,
+              leaseExpiresAtMs: 0,
+              updatedAtMs: now,
+            });
+          } catch {
+            // Bookkeeping failure never changes the terminal verdict.
+          }
+          // A completed wrap clears any watchdog: the goal is terminal.
+          try {
+            deps.onTurnSettled?.({ ok: true, deadlineMs: null });
+          } catch {
+            // Settle hook is best-effort.
+          }
+          return { decision: 'stopped', reason: gate.reason };
+        }
+        // Send failed: record a retry attempt and stop without flipping.
+        const wrapPending = buildPendingAttempt(cur, 'provider-error', now);
         try {
           await deps.saveState(statePath, {
-            ...(current as GoalState),
-            wrapupSent: true,
+            ...cur,
+            pendingAttempt: wrapPending,
+            failureCount: cur.failureCount + 1,
+            leaseOwner: null,
+            leaseExpiresAtMs: 0,
             updatedAtMs: now,
           });
         } catch {
-          // Bookkeeping failure never changes the terminal verdict.
+          // Cleanup failure keeps the send failure as the reported reason.
         }
+        // A failed wrap re-arms the watchdog so the wrap can be retried.
+        try {
+          deps.onTurnSettled?.({
+            ok: false,
+            deadlineMs: wrapPending.deadlineMs,
+          });
+        } catch {
+          // Settle hook is best-effort.
+        }
+        return { decision: 'stopped', reason: 'send-failed' };
       }
       return {
         decision: terminal ? 'stopped' : 'skipped',
@@ -363,41 +775,33 @@ export async function handleSessionIdle(
       return { decision: 'skipped', reason: 'lease-held' };
     }
     const prompt = buildContinuationPrompt(claimed.state);
-    let sent: { messageId: string; tokenSpend?: number };
+    let rawSent: unknown;
     try {
-      sent = await deps.sendPrompt(prompt);
-    } catch {
-      // Send failure clears our lease so the next tick can retry, then stops this tick.
-      try {
-        await deps.saveState(statePath, {
-          ...claimed.state,
-          leaseOwner: null,
-          leaseExpiresAtMs: 0,
-          updatedAtMs: deps.clock.nowMs(),
-        });
-      } catch {
-        // Cleanup failure keeps the original send failure as the reported reason.
-      }
-      return { decision: 'stopped', reason: 'send-failed' };
+      rawSent = await deps.sendPrompt(prompt);
+    } catch (err: unknown) {
+      // A thrown send is retryable unless it is a user abort, which parks.
+      return settleFailedSend(
+        statePath,
+        claimed.state,
+        deps,
+        classifyFailure(err),
+        sessionPart,
+      );
     }
-    // Validate the send result: an empty id would poison human-message yield next tick.
-    if (
-      typeof sent !== 'object' ||
-      sent === null ||
-      typeof sent.messageId !== 'string' ||
-      sent.messageId.length === 0
-    ) {
-      try {
-        await deps.saveState(statePath, {
-          ...claimed.state,
-          leaseOwner: null,
-          leaseExpiresAtMs: 0,
-          updatedAtMs: deps.clock.nowMs(),
-        });
-      } catch {
-        // Same cleanup path as a thrown send failure.
-      }
-      return { decision: 'stopped', reason: 'send-failed' };
+    const sent = normalizeSendResult(rawSent);
+    // A failed send never advances the turn and stays retryable for the watchdog.
+    if (!sent.success) {
+      // A non-retryable failure is a user abort: park instead of retrying.
+      const kind: FailureKind = sent.retryable
+        ? 'provider-error'
+        : 'user-abort';
+      return settleFailedSend(
+        statePath,
+        claimed.state,
+        deps,
+        kind,
+        sessionPart,
+      );
     }
     // Post-send timestamp: slow sends must not shorten the real cooldown.
     const afterSend = deps.clock.nowMs();
@@ -408,6 +812,12 @@ export async function handleSessionIdle(
       lastContinuedMessageId: sent.messageId,
       tokenSpend: claimed.state.tokenSpend + safeSpend(sent.tokenSpend),
       updatedAtMs: afterSend,
+      // Success clears the retry episode and records a fresh heartbeat.
+      pendingAttempt: null,
+      lastHeartbeatMs: afterSend,
+      failureCount: 0,
+      // Remember the real session so a restart can rearm the right lane.
+      lastSessionId: sessionPart,
       leaseOwner: null,
       leaseExpiresAtMs: 0,
     };
@@ -421,6 +831,12 @@ export async function handleSessionIdle(
       recordPerSessionTick(tokenKey, afterSend);
     } catch {
       // Cooldown bookkeeping never blocks a successful send.
+    }
+    // A successful turn clears any watchdog: no stale wake should fire.
+    try {
+      deps.onTurnSettled?.({ ok: true, deadlineMs: null });
+    } catch {
+      // Settle hook is best-effort.
     }
     return { decision: 'sent', reason: 'ok', messageId: sent.messageId };
   } finally {
