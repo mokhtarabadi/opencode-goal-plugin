@@ -40,6 +40,7 @@ import {
 } from './compaction.js';
 import { saveEvidence, emptyEvidence, loadEvidence } from './evidence.js';
 import { tryCompleteWithEvidence } from './verifier.js';
+import { registerGoalTools } from './tools.js';
 import {
   armWatchdog,
   clearWatchdog,
@@ -646,6 +647,17 @@ export default Plugin.define({
       }
     } catch {
       // Command registration is best-effort; idle and hooks still arm below.
+    }
+
+    // Agent-callable goal tools: goal_set, goal_block, goal_complete, goal_resume.
+    // Why beside the slash lane: both lanes share handleGoalCommand, so the
+    // model can drive the goal itself while user slash commands keep working.
+    // Best-effort like the command above: a host without the tool domain still
+    // runs slash plus idle plus hooks.
+    try {
+      await registerGoalTools(ctx, projectDir, clock);
+    } catch {
+      // Tool registration failure never breaks the slash lane below.
     }
 
     // Idle auto-continue: one safe turn per session idle tick.

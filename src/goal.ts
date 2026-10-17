@@ -125,6 +125,43 @@ export const GoalInputSchema = {
 } as const;
 
 /**
+ * JSON Schema for the block tool input.
+ * Why this schema exists: reason is required, max 2000 to match the parser,
+ * closed against extra props so strict providers accept it.
+ */
+export const BlockInputSchema = {
+  type: 'object',
+  properties: {
+    reason: { type: 'string', minLength: 1, maxLength: 2000 },
+  },
+  required: ['reason'],
+  additionalProperties: false,
+} as const;
+
+/**
+ * JSON Schema for the complete and resume tool inputs.
+ * Why this schema exists: neither takes arguments — complete reads the
+ * evidence sidecar, resume acts on the parked state. Closed and empty.
+ */
+export const CompleteInputSchema = {
+  type: 'object',
+  properties: {},
+  additionalProperties: false,
+} as const;
+
+/**
+ * JSON Schema for the resume tool input.
+ * Why an independent literal: it must never alias CompleteInputSchema by
+ * reference, so a future edit to one shape cannot silently mutate the other.
+ * Same empty closed shape today, separate object identity always.
+ */
+export const ResumeInputSchema = {
+  type: 'object',
+  properties: {},
+  additionalProperties: false,
+} as const;
+
+/**
  * Validate a goal title against traversal plus absolute-path abuse.
  * Why this guard exists: evidence citations must stay inside the project.
  * Objectives that are bare paths could trick later file resolution.
