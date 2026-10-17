@@ -33,3 +33,8 @@ Rollback: revert this slice; the pure loop plus file state keep prior idle-only 
 
 Context: the model could only be driven by user slash commands or the idle loop; smart-compact showed an agent tool lane (compact_context) reusing command helpers. Decision: register goal_set, goal_block, goal_complete, goal_resume via ctx.tool.transform in new src/tools.ts, each execute calling the pure goal.js helpers directly with validated data (never rebuilding slash strings, so reserved-word titles cannot misroute), claiming the file lease under owner tool:<sessionID> before mutating, and returning handleGoalCommand-identical messages (parity-tested). Consequence: model-driven and user-driven paths share validation, evidence gate, Clock, and atomic save with zero drift, and parallel tool calls serialize instead of clobbering.
 Rollback: remove the registerGoalTools call; file state untouched.
+
+## ADR-009 2026-10-17 Sole evidence writer closes the completion loop
+
+Context: goal_complete could never succeed because no code path ever wrote criteria into the evidence sidecar (both lanes only read it). Decision: add goal_evidence as the fifth agent tool and sole evidence writer plus a /goal evidence slash mirror delegating to the same recordEvidence handler; id, claim, files, tests all required with shape-only validation at write (existence plus passing stay verifier-side); duplicate ids rejected; writes only on active goals under the state-file lease. Consequence: set to evidence to complete passes with real proof while empty or fabricated evidence still fails, and the verifier plus evidence modules are untouched.
+Rollback: remove the tool def plus the slash branch; the sidecar file is per-project runtime state, no migration involved.

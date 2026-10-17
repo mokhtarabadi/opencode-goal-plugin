@@ -14,6 +14,13 @@ export type ParsedGoal =
   | { kind: 'block'; reason: string }
   | { kind: 'complete' }
   | { kind: 'resume' }
+  | {
+      kind: 'evidence';
+      id: string;
+      claim: string;
+      files: string[];
+      tests: { command: string; exitCode: number }[];
+    }
   | { kind: 'invalid'; raw: string };
 
 export const MAX_OBJECTIVE_LEN = 2000;
@@ -103,6 +110,19 @@ export function parseGoalCommand(rawInput: string): ParsedGoal {
       return { kind: 'invalid', raw: rawInput };
     return { kind: 'block', reason };
   }
+  if (
+    bodyLower.startsWith('evidence ') ||
+    bodyLower.startsWith('evidence\t') ||
+    bodyLower.startsWith('evidence\n')
+  ) {
+    // Block-style args: id plus claim required, files plus tests optional.
+    // Claim may contain spaces, so args split on known key boundaries.
+    return parseGoalEvidence(body.slice('evidence'.length).trim(), rawInput);
+  }
+  if (bodyLower === 'evidence') {
+    // Bare evidence names no criterion, so the write would be unactionable.
+    return { kind: 'invalid', raw: rawInput };
+  }
   if (body.length > MAX_OBJECTIVE_LEN) {
     return { kind: 'invalid', raw: rawInput };
   }
@@ -160,6 +180,127 @@ export const ResumeInputSchema = {
   properties: {},
   additionalProperties: false,
 } as const;
+
+/**
+ * JSON Schema for the evidence tool input.
+ * Why this schema exists: goal_evidence is the sole writer of the evidence
+ * sidecar, so its shape must match EvidenceCriterion exactly. id, claim,
+ * files, plus tests are all required with at least one entry each, because
+ * loadEvidence drops sidecars that fail validateEvidenceShape and that
+ * shape rejects empty files plus tests. Existence plus passing checks still
+ * stay in the verifier at complete time — the writer checks shape only.
+ */
+export const EvidenceInputSchema = {
+  type: 'object',
+  properties: {
+    id: { type: 'string', minLength: 1, maxLength: 200 },
+    claim: { type: 'string', minLength: 1, maxLength: 2000 },
+    files: {
+      type: 'array',
+      minItems: 1,
+      items: { type: 'string', minLength: 1 },
+    },
+    tests: {
+      type: 'array',
+      minItems: 1,
+      items: {
+        type: 'object',
+        properties: {
+          command: { type: 'string', minLength: 1 },
+          exitCode: { type: 'integer' },
+        },
+        required: ['command', 'exitCode'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['id', 'claim', 'files', 'tests'],
+  additionalProperties: false,
+} as const;
+
+/** One evidence test proof as parsed from slash args. */
+export interface ParsedEvidenceTest {
+  /** Test command, non-empty. */
+  command: string;
+  /** Process exit code, integer. */
+  exitCode: number;
+}
+
+/**
+ * Extract one key=value arg from a block-style arg string.
+ * Why boundary matching: claim values may contain spaces, so args split on
+ * known key starts (id, claim, files, tests) rather than on whitespace.
+ * Returns the trimmed value or null when the key is absent.
+ * @param args raw arg string after the evidence keyword
+ * @param key one of id, claim, files, tests
+ */
+function extractArg(args: string, key: string): string | null {
+  // Key must start the string or follow whitespace, so a claim mentioning
+  // "files=" mid-sentence cannot hijack the parse.
+  const open = new RegExp('(?:^|\\s)' + key + '=').exec(args);
+  if (!open) return null;
+  const rest = args.slice(open.index + open[0].length);
+  const next = /(?:\s)(?:id|claim|files|tests)=/.exec(rest);
+  return (next ? rest.slice(0, next.index) : rest).trim();
+}
+
+/**
+ * Parse block-style evidence args into a ParsedGoal evidence kind.
+ * Format: id=<short-id> claim=<one-line claim> files=<a,b> tests=<cmd:code;...>.
+ * files splits on comma, tests splits on semicolon with command and exit code
+ * split on the LAST colon so commands containing colons survive.
+ * Shape-only: non-empty id plus claim plus at least one file plus at least
+ * one test. Existence plus passing checks stay in the verifier at complete
+ * time. files plus tests are mandatory (not defaulted) because the stored
+ * sidecar must always pass validateEvidenceShape, which rejects empties.
+ * @param args raw arg string after the evidence keyword
+ * @param rawInput original input for the invalid fallback
+ */
+export function parseGoalEvidence(args: string, rawInput: string): ParsedGoal {
+  const id = extractArg(args, 'id');
+  const claim = extractArg(args, 'claim');
+  // id plus claim are required and length-capped like title plus reason.
+  if (!id || !claim) return { kind: 'invalid', raw: rawInput };
+  if (id.length > 200 || claim.length > MAX_OBJECTIVE_LEN) {
+    return { kind: 'invalid', raw: rawInput };
+  }
+  const filesRaw = extractArg(args, 'files');
+  // files plus tests are mandatory: the stored sidecar must always pass
+  // validateEvidenceShape, which rejects empty arrays.
+  if (filesRaw === null || filesRaw === '') {
+    return { kind: 'invalid', raw: rawInput };
+  }
+  const files = filesRaw
+    .split(',')
+    .map((f) => f.trim())
+    .filter((f) => f.length > 0);
+  if (files.length === 0) {
+    return { kind: 'invalid', raw: rawInput };
+  }
+  const testsRaw = extractArg(args, 'tests');
+  if (testsRaw === null || testsRaw === '') {
+    return { kind: 'invalid', raw: rawInput };
+  }
+  const tests: ParsedEvidenceTest[] = [];
+  for (const part of testsRaw.split(';')) {
+    const item = part.trim();
+    if (item.length === 0) return { kind: 'invalid', raw: rawInput };
+    const colon = item.lastIndexOf(':');
+    if (colon <= 0) return { kind: 'invalid', raw: rawInput };
+    const command = item.slice(0, colon).trim();
+    // Empty code must reject: Number('') coerces to 0, which would forge
+    // a passing proof out of a trailing colon with no exit code.
+    const codeRaw = item.slice(colon + 1).trim();
+    if (codeRaw.length === 0) return { kind: 'invalid', raw: rawInput };
+    const code = Number(codeRaw);
+    if (command.length === 0 || !Number.isInteger(code)) {
+      return { kind: 'invalid', raw: rawInput };
+    }
+    tests.push({ command, exitCode: code });
+  }
+  if (tests.length === 0) return { kind: 'invalid', raw: rawInput };
+  return { kind: 'evidence', id, claim, files, tests };
+}
 
 /**
  * Validate a goal title against traversal plus absolute-path abuse.

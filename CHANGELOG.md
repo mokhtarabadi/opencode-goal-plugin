@@ -16,6 +16,7 @@ All notable changes follow Keep a Changelog.
 - V2 strictness with goal input JSON Schema plus traversal-safe title check.
 - Crash recovery: session.error plus execution.failed listeners, classifyFailure, 90s watchdog, session-start rearm, retryable send, persisted pendingAttempt.
 - Agent-callable goal tools (goal_set, goal_block, goal_complete, goal_resume) calling pure helpers directly with lease guard and slash-identical messages.
+- Fifth agent tool goal_evidence (sole evidence writer) plus /goal evidence slash mirror: set to evidence to complete is now reachable with the verifier gate unchanged.
 
 ### Fixed
 
@@ -28,6 +29,7 @@ All notable changes follow Keep a Changelog.
 - Hotfix idle survival: compaction keeps live controller, stale entries cleared.
 - Hotfix evidence wiring: both complete lanes require proof plus wrapupSent once.
 - Hotfix setup guard plus session fairness plus lease proof with sidecar.
+- Hotfix evidence validation: slash rejects empty exit codes (Number('') coerces to 0); tool trims file entries and rejects partial bad files/tests arrays instead of silently dropping.
 - Hotfix2 afterSend Clock plus Set copy plus prune helper plus drive-relative guard.
 
 ## [0.3.0] - 2026-10-16

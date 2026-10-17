@@ -40,7 +40,7 @@ import {
 } from './compaction.js';
 import { saveEvidence, emptyEvidence, loadEvidence } from './evidence.js';
 import { tryCompleteWithEvidence } from './verifier.js';
-import { registerGoalTools } from './tools.js';
+import { recordEvidence, registerGoalTools } from './tools.js';
 import {
   armWatchdog,
   clearWatchdog,
@@ -177,6 +177,21 @@ export async function handleGoalCommand(
       return 'Failed to save goal state: ' + (err as Error).message;
     }
     return 'Goal marked blocked: ' + parsed.reason;
+  }
+  if (parsed.kind === 'evidence') {
+    // Parity by construction: the slash lane calls the tool handler directly,
+    // so validation plus lease plus messages cannot drift between lanes.
+    return await recordEvidence(
+      projectDir,
+      clock,
+      {
+        id: parsed.id,
+        claim: parsed.claim,
+        files: parsed.files,
+        tests: parsed.tests,
+      },
+      'slash',
+    );
   }
   if (parsed.kind === 'complete') {
     // Evidence gate: active goals need proof, blocked or done still report status.

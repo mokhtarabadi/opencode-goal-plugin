@@ -1,7 +1,7 @@
 # Goal Plugin — Agent Tool Manual
 
 Reader: you are an AI coding agent running inside OpenCode with the
-`opencode-goal-plugin` loaded. This file teaches you the four tools that
+`opencode-goal-plugin` loaded. This file teaches you the five tools that
 **you yourself** can call. It is not for the human operator. The human uses
 slash commands (`/goal ...`); you use the tools below. Both lanes write the
 same state file, so they never disagree.
@@ -76,8 +76,8 @@ It takes no arguments. If proof is missing you get:
 Complete blocked: <reason>. Add file citations plus passing tests to evidence.
 ```
 
-Do not retry blindly. Write the evidence first (or do the work that earns
-it), then call again. Success response:
+Do not retry blindly. Record the evidence first with `goal_evidence`
+(do the work that earns it), then call again. Success response:
 
 ```text
 Goal marked complete.
@@ -102,6 +102,33 @@ Success response:
 
 ```text
 Goal resumed: <the objective text>
+```
+
+## Tool 5 — goal_evidence
+
+Record proof for the active goal. This is the **sole evidence writer**:
+the only way proof ever enters `.opencode/goal-evidence.json`. One call
+appends one criterion; call it once per criterion you can prove.
+
+```json
+{
+  "id": "build-pass",
+  "claim": "Build passes on a clean tree",
+  "files": ["src/index.ts"],
+  "tests": [{ "command": "npm test", "exitCode": 0 }]
+}
+```
+
+Rules: `id` plus `claim` are required (non-empty, id max 200 chars,
+claim max 2000), plus at least one `files` entry and one `tests` entry —
+the stored sidecar always passes shape validation, so empties are rejected
+up front. File existence plus passing status are still checked at
+`goal_complete` time, so citations may point at work in progress.
+Requires an `active` goal; duplicate `id` values are rejected, so each
+criterion is recorded once. Same syntax as `/goal evidence`. Success response:
+
+```text
+Criterion recorded for <id>.
 ```
 
 ## Responses you must handle
@@ -133,7 +160,8 @@ Report this to the human. Do not invent state.
 2. `goal_complete` without evidence always fails. This is deliberate.
 3. Titles and reasons are literal data. Newlines, slashes, and words like
    `block`, `clear`, or `resume` inside them trigger nothing.
-4. All four schemas reject extra properties. Send exactly the fields shown.
+4. All five schemas reject extra properties. Send exactly the fields shown.
 5. Never write `.opencode/goal-state.json` or `.opencode/goal-evidence.json`
-   with file tools. Always go through these four tools, so the lease,
-   the validation, and the evidence gate stay in force.
+   with file tools. Always go through these five tools (`goal_evidence` is
+   the sole evidence writer), so the lease, the validation, and the
+   evidence gate stay in force.

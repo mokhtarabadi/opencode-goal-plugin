@@ -1,8 +1,8 @@
 /**
  * Agent-callable goal tools.
  * Why this module exists: the model needs to drive the goal itself mid-session
- * (set, block, complete, resume) without waiting for the user to type a slash
- * command. This mirrors the smart-compact `compact_context` tool pattern:
+ * (set, block, complete, resume, evidence) without waiting for the user to type
+ * a slash command. This mirrors the smart-compact `compact_context` tool pattern:
  * `ctx.tool.transform` with a JSON Schema input.
  * Each execute path calls the pure transition helpers in goal.js directly with
  * already-validated data — never by rebuilding a slash string, so a title
@@ -23,6 +23,7 @@ import {
 import {
   BlockInputSchema,
   CompleteInputSchema,
+  EvidenceInputSchema,
   GoalInputSchema,
   ResumeInputSchema,
   blockGoal,
@@ -31,7 +32,12 @@ import {
   resumeGoal,
   setObjective,
 } from './goal.js';
-import { loadEvidence } from './evidence.js';
+import {
+  emptyEvidence,
+  loadEvidence,
+  saveEvidence,
+  validateEvidenceShape,
+} from './evidence.js';
 import { tryCompleteWithEvidence } from './verifier.js';
 
 /** Host version stamped on tool-created state, matching the slash lane. */
@@ -229,6 +235,145 @@ async function toolBlock(
 }
 
 /**
+ * Record one evidence criterion for the active goal.
+ * Why this function is exported: the slash lane calls it directly so both
+ * lanes share one write path with identical validation — parity by construction.
+ * Sole evidence writer: no other code path appends criteria.
+ * Why shape-only here: file existence plus passing tests are verified at
+ * complete time by the verifier, so a criterion citing work-in-progress
+ * files is storable but cannot complete until the proof is real.
+ * Order: active-goal check, then lease, then load-or-seed, then dup check,
+ * then shape check, then append plus save. Every rejection writes nothing.
+ * @param projectDir project root containing the .opencode dir
+ * @param clock injected clock
+ * @param input raw tool input with id, claim, files, tests
+ * @param sessionID lane id for the lease owner
+ */
+export async function recordEvidence(
+  projectDir: string,
+  clock: Clock,
+  input: unknown,
+  sessionID: string,
+): Promise<string> {
+  const raw = input as {
+    id?: unknown;
+    claim?: unknown;
+    files?: unknown;
+    tests?: unknown;
+  } | null;
+  const id = typeof raw?.id === 'string' ? raw.id.trim() : '';
+  const claim = typeof raw?.claim === 'string' ? raw.claim.trim() : '';
+  // Strict arrays with trimmed storage: any bad entry rejects the whole call
+  // instead of silently dropping, so caller bugs cannot hide as success and
+  // stored files match the slash lane exactly (verifier checks exact paths).
+  const filesInput = Array.isArray(raw?.files) ? raw.files : null;
+  let files: string[] | null = null;
+  if (filesInput !== null) {
+    const out: string[] = [];
+    let bad = false;
+    for (const f of filesInput) {
+      if (typeof f !== 'string' || f.trim().length === 0) {
+        bad = true;
+        break;
+      }
+      out.push(f.trim());
+    }
+    files = bad ? [] : out;
+  }
+  const testsInput = Array.isArray(raw?.tests) ? raw.tests : null;
+  let tests: { command: string; exitCode: number }[] | null = null;
+  if (testsInput !== null) {
+    const out: { command: string; exitCode: number }[] = [];
+    let bad = false;
+    for (const t of testsInput) {
+      if (
+        typeof t !== 'object' ||
+        t === null ||
+        typeof (t as { command?: unknown }).command !== 'string' ||
+        ((t as { command?: unknown }).command as string).trim().length === 0 ||
+        !Number.isInteger((t as { exitCode?: unknown }).exitCode)
+      ) {
+        bad = true;
+        break;
+      }
+      out.push({
+        command: ((t as { command: string }).command as string).trim(),
+        exitCode: (t as { exitCode: number }).exitCode as number,
+      });
+    }
+    tests = bad ? [] : out;
+  }
+  // Shape check first: malformed input never touches state or lease.
+  // files plus tests need at least one entry each: the stored sidecar must
+  // always pass validateEvidenceShape, which rejects empty arrays.
+  // File existence plus passing tests stay verifier-side at complete time.
+  if (
+    id.length === 0 ||
+    id.length > 200 ||
+    claim.length === 0 ||
+    claim.length > 2000 ||
+    files === null ||
+    files.length === 0 ||
+    tests === null ||
+    tests.length === 0
+  ) {
+    return 'Invalid /goal evidence usage. Provide id=<id> claim=<claim> files=<a,b> tests=<cmd:exitCode>.';
+  }
+  const statePath = resolveStatePath(projectDir);
+  const loaded = await loadForTool(statePath);
+  if ('error' in loaded) return loaded.error;
+  if (loaded.state === null) {
+    return 'No goal set. Use /goal <objective> first.';
+  }
+  if (loaded.state.status !== 'active') {
+    return (
+      'Only an active goal can record evidence. Current status: ' +
+      loaded.state.status +
+      '.'
+    );
+  }
+  const owner = 'tool:' + sessionID;
+  const claimRes = await claimForTool(statePath, loaded.state, owner, clock);
+  if (!claimRes.claimed) return BUSY_MESSAGE;
+  try {
+    // Null sidecar (e.g. tool-lane set never seeded one) starts empty.
+    const current = (await loadEvidence(projectDir)) ?? emptyEvidence(0);
+    if (current.criteria.some((c) => c.id === id)) {
+      return 'Evidence id already recorded: ' + id + '.';
+    }
+    const candidate = {
+      version: current.version,
+      updatedAtMs: clock.nowMs(),
+      criteria: [
+        ...current.criteria,
+        {
+          id,
+          claim,
+          files,
+          tests: tests.map((t) => ({
+            command: t.command.trim(),
+            exitCode: t.exitCode,
+          })),
+        },
+      ],
+    };
+    // Full-file shape check reuses the verifier's own gate shape.
+    const shape = validateEvidenceShape(candidate);
+    if (!shape.ok) {
+      return 'Invalid evidence shape: ' + shape.reason + '.';
+    }
+    try {
+      await saveEvidence(projectDir, candidate);
+    } catch (err) {
+      return 'Failed to save evidence: ' + (err as Error).message;
+    }
+    return 'Criterion recorded for ' + id + '.';
+  } finally {
+    await releaseToolLease(statePath, owner, clock);
+  }
+}
+
+/**
  * Mark the active goal complete through the evidence gate.
  * Why gate order matches the slash lane: status errors surface before proof
  * checks, so blocked or finished goals report status instead of demanding
@@ -326,8 +471,8 @@ async function toolResume(
 }
 
 /**
- * The four agent-callable goal tool definitions.
- * Why four separate tools: clearer prompts and least privilege beat one
+ * The five agent-callable goal tool definitions.
+ * Why five separate tools: clearer prompts and least privilege beat one
  * multi-action tool. Schemas live in goal.ts beside GoalInputSchema.
  */
 function goalToolDefs(projectDir: string, clock: Clock): GoalToolDef[] {
@@ -406,6 +551,26 @@ function goalToolDefs(projectDir: string, clock: Clock): GoalToolDef[] {
             content: await toolResume(
               projectDir,
               clock,
+              toolSessionId(context),
+            ),
+          };
+        } catch {
+          return { content: 'Goal tool failed without changing state.' };
+        }
+      },
+    },
+    {
+      name: 'goal_evidence',
+      description:
+        'Record one evidence criterion for the active goal. Sole evidence writer. Slash parity /goal evidence.',
+      input: EvidenceInputSchema,
+      execute: async (input: unknown, context: unknown) => {
+        try {
+          return {
+            content: await recordEvidence(
+              projectDir,
+              clock,
+              input,
               toolSessionId(context),
             ),
           };

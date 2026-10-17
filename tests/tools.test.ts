@@ -1,6 +1,6 @@
 /**
  * Tests for agent-callable goal tools.
- * Why these tests exist: prove the tool lane registers four tools and shares
+ * Why these tests exist: prove the tool lane registers five tools and shares
  * the exact slash handler, so model-driven and user-driven paths cannot drift.
  */
 import { describe, expect, it } from 'vitest';
@@ -11,6 +11,7 @@ import { registerGoalTools } from '../src/tools.js';
 import {
   BlockInputSchema,
   CompleteInputSchema,
+  EvidenceInputSchema,
   GoalInputSchema,
   ResumeInputSchema,
 } from '../src/goal.js';
@@ -45,7 +46,7 @@ function fakeCtx(defs: CapturedDef[]): unknown {
 }
 
 describe('registerGoalTools', () => {
-  it('registers four tools beside the slash lane', async () => {
+  it('registers five tools beside the slash lane', async () => {
     const defs: CapturedDef[] = [];
     const out = await registerGoalTools(
       fakeCtx(defs),
@@ -58,6 +59,7 @@ describe('registerGoalTools', () => {
       'goal_block',
       'goal_complete',
       'goal_resume',
+      'goal_evidence',
     ]);
     for (const d of defs) {
       expect(typeof d.description).toBe('string');
@@ -88,6 +90,15 @@ describe('tool schemas', () => {
     expect(BlockInputSchema.additionalProperties).toBe(false);
     expect(CompleteInputSchema.additionalProperties).toBe(false);
     expect(ResumeInputSchema.additionalProperties).toBe(false);
+  });
+  it('evidence requires id plus claim plus files plus tests and closes extra props', () => {
+    expect(EvidenceInputSchema.required).toEqual([
+      'id',
+      'claim',
+      'files',
+      'tests',
+    ]);
+    expect(EvidenceInputSchema.additionalProperties).toBe(false);
   });
 });
 
@@ -278,5 +289,300 @@ describe('tool execute parity with slash', () => {
       clock,
     );
     expect(toolBlock2.content).toBe(slashBlock2);
+  });
+  it('evidence tool result matches slash result for the same op', async () => {
+    const { handleGoalCommand } = await import('../src/index.js');
+    const clock = new FakeClock();
+    const dirTool = mkdtempSync(path.join(tmpdir(), 'goal-tools-parE-'));
+    const dirSlash = mkdtempSync(path.join(tmpdir(), 'goal-tools-parES-'));
+    const defs = await toolDefs(dirTool);
+    await byName(defs, 'goal_set').execute({ title: 'parity-ev' }, {});
+    await handleGoalCommand('/goal parity-ev', dirSlash, clock);
+    const input = {
+      id: 'e1',
+      claim: 'parity holds',
+      files: ['src/a.ts'],
+      tests: [{ command: 'npm test', exitCode: 0 }],
+    };
+    const toolEv = await byName(defs, 'goal_evidence').execute(input, {});
+    const slashEv = await handleGoalCommand(
+      '/goal evidence id=e1 claim=parity holds files=src/a.ts tests=npm test:0',
+      dirSlash,
+      clock,
+    );
+    expect(toolEv.content).toBe(slashEv);
+    expect(toolEv.content).toContain('Criterion recorded for e1');
+  });
+});
+
+describe('goal_evidence sole writer', () => {
+  async function toolDefs(dir: string): Promise<CapturedDef[]> {
+    const defs: CapturedDef[] = [];
+    await registerGoalTools(fakeCtx(defs), dir, new FakeClock());
+    return defs;
+  }
+  function byName(defs: CapturedDef[], name: string): CapturedDef {
+    const found = defs.find((d) => d.name === name);
+    if (!found) throw new Error('missing tool ' + name);
+    return found;
+  }
+  it('set to evidence to complete passes the gate with real proof', async () => {
+    const { writeFileSync } = await import('node:fs');
+    const { loadEvidence } = await import('../src/evidence.js');
+    const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-evok-'));
+    writeFileSync(path.join(dir, 'proof.txt'), 'done\n');
+    const defs = await toolDefs(dir);
+    await byName(defs, 'goal_set').execute({ title: 'prove it' }, {});
+    const rec = await byName(defs, 'goal_evidence').execute(
+      {
+        id: 'e1',
+        claim: 'work is done',
+        files: ['proof.txt'],
+        tests: [{ command: 'npm test', exitCode: 0 }],
+      },
+      { sessionID: 'sess-ev' },
+    );
+    expect(rec.content).toContain('Criterion recorded for e1');
+    const ev = await loadEvidence(dir);
+    expect(ev?.criteria.map((c) => c.id)).toEqual(['e1']);
+    const done = await byName(defs, 'goal_complete').execute({}, {});
+    expect(done.content).toBe('Goal marked complete.');
+  });
+  it('hostile shape writes nothing', async () => {
+    const { existsSync } = await import('node:fs');
+    const { resolveEvidencePath } = await import('../src/evidence.js');
+    const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-evbad-'));
+    const defs = await toolDefs(dir);
+    await byName(defs, 'goal_set').execute({ title: 'baseline' }, {});
+    const bad = await byName(defs, 'goal_evidence').execute(
+      { id: '', claim: '' },
+      {},
+    );
+    expect(bad.content).toContain('Invalid');
+    expect(existsSync(resolveEvidencePath(dir))).toBe(false);
+  });
+  it('duplicate id is rejected with no second write', async () => {
+    const { loadEvidence } = await import('../src/evidence.js');
+    const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-evdup-'));
+    const defs = await toolDefs(dir);
+    await byName(defs, 'goal_set').execute({ title: 'dup' }, {});
+    const input = {
+      id: 'e1',
+      claim: 'first',
+      files: ['src/a.ts'],
+      tests: [{ command: 'npm test', exitCode: 0 }],
+    };
+    expect(
+      (await byName(defs, 'goal_evidence').execute(input, {})).content,
+    ).toContain('Criterion recorded');
+    const dup = await byName(defs, 'goal_evidence').execute(input, {});
+    expect(dup.content).toContain('already recorded');
+    expect((await loadEvidence(dir))?.criteria.length).toBe(1);
+  });
+  it('held lease blocks evidence write without changing state', async () => {
+    const { existsSync } = await import('node:fs');
+    const { tryClaimLease, resolveStatePath, LEASE_TTL_MS } =
+      await import('../src/state.js');
+    const { resolveEvidencePath } = await import('../src/evidence.js');
+    const clock = new FakeClock();
+    const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-evrace-'));
+    const defs = await toolDefs(dir);
+    await byName(defs, 'goal_set').execute({ title: 'baseline' }, {});
+    const held = await tryClaimLease(
+      resolveStatePath(dir),
+      'loop',
+      LEASE_TTL_MS,
+      clock,
+    );
+    expect(held.claimed).toBe(true);
+    const out = await byName(defs, 'goal_evidence').execute(
+      {
+        id: 'e1',
+        claim: 'racy',
+        files: ['src/a.ts'],
+        tests: [{ command: 'npm test', exitCode: 0 }],
+      },
+      { sessionID: 'sess-race' },
+    );
+    expect(out.content).toMatch(/busy|lease|Busy/i);
+    expect(existsSync(resolveEvidencePath(dir))).toBe(false);
+  });
+  it('blocked goal rejects evidence with no write', async () => {
+    const { existsSync } = await import('node:fs');
+    const { resolveEvidencePath } = await import('../src/evidence.js');
+    const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-evblk-'));
+    const defs = await toolDefs(dir);
+    await byName(defs, 'goal_set').execute({ title: 'stuck' }, {});
+    await byName(defs, 'goal_block').execute({ reason: 'wait' }, {});
+    const out = await byName(defs, 'goal_evidence').execute(
+      {
+        id: 'e1',
+        claim: 'late',
+        files: ['src/a.ts'],
+        tests: [{ command: 'npm test', exitCode: 0 }],
+      },
+      {},
+    );
+    expect(out.content).toContain('Only an active goal');
+    expect(existsSync(resolveEvidencePath(dir))).toBe(false);
+  });
+  it('no goal set reports status with no lease held', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-evnone-'));
+    const defs = await toolDefs(dir);
+    const out = await byName(defs, 'goal_evidence').execute(
+      {
+        id: 'e1',
+        claim: 'orphan',
+        files: ['src/a.ts'],
+        tests: [{ command: 'npm test', exitCode: 0 }],
+      },
+      {},
+    );
+    expect(out.content).toContain('No goal set');
+  });
+});
+
+describe('hotfix qa-reject negative paths', () => {
+  async function toolDefs(dir: string): Promise<CapturedDef[]> {
+    const defs: CapturedDef[] = [];
+    await registerGoalTools(fakeCtx(defs), dir, new FakeClock());
+    return defs;
+  }
+  function byName(defs: CapturedDef[], name: string): CapturedDef {
+    const found = defs.find((d) => d.name === name);
+    if (!found) throw new Error('missing tool ' + name);
+    return found;
+  }
+  const good = {
+    id: 'e1',
+    claim: 'holds',
+    files: ['src/a.ts'],
+    tests: [{ command: 'npm test', exitCode: 0 }],
+  };
+  it('slash with empty exit code is invalid and writes nothing', async () => {
+    const { existsSync } = await import('node:fs');
+    const { handleGoalCommand } = await import('../src/index.js');
+    const { resolveEvidencePath } = await import('../src/evidence.js');
+    const clock = new FakeClock();
+    const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-qe1-'));
+    await handleGoalCommand('/goal slash-ev', dir, clock);
+    const out = await handleGoalCommand(
+      '/goal evidence id=e-bad claim=x files=src/a.ts tests=npm test:',
+      dir,
+      clock,
+    );
+    expect(out).toContain('Invalid');
+    expect(existsSync(resolveEvidencePath(dir))).toBe(false);
+  });
+  it('slash with spaces-only exit code is invalid and writes nothing', async () => {
+    const { existsSync } = await import('node:fs');
+    const { handleGoalCommand } = await import('../src/index.js');
+    const { resolveEvidencePath } = await import('../src/evidence.js');
+    const clock = new FakeClock();
+    const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-qe1b-'));
+    await handleGoalCommand('/goal slash-ev', dir, clock);
+    const out = await handleGoalCommand(
+      '/goal evidence id=e-bad claim=x files=src/a.ts tests=npm test:  ',
+      dir,
+      clock,
+    );
+    expect(out).toContain('Invalid');
+    expect(existsSync(resolveEvidencePath(dir))).toBe(false);
+  });
+  it('bare slash evidence is invalid and writes nothing', async () => {
+    const { existsSync } = await import('node:fs');
+    const { handleGoalCommand } = await import('../src/index.js');
+    const { resolveEvidencePath } = await import('../src/evidence.js');
+    const clock = new FakeClock();
+    const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-qe2-'));
+    await handleGoalCommand('/goal slash-ev', dir, clock);
+    const out = await handleGoalCommand('/goal evidence', dir, clock);
+    expect(out).toContain('Invalid');
+    expect(existsSync(resolveEvidencePath(dir))).toBe(false);
+  });
+  it('tool rejects empty files or empty tests arrays with no write', async () => {
+    const { existsSync } = await import('node:fs');
+    const { resolveEvidencePath } = await import('../src/evidence.js');
+    const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-qe3-'));
+    const defs = await toolDefs(dir);
+    await byName(defs, 'goal_set').execute({ title: 'base' }, {});
+    const noFiles = await byName(defs, 'goal_evidence').execute(
+      { ...good, files: [] },
+      {},
+    );
+    expect(noFiles.content).toContain('Invalid');
+    const noTests = await byName(defs, 'goal_evidence').execute(
+      { ...good, tests: [] },
+      {},
+    );
+    expect(noTests.content).toContain('Invalid');
+    expect(existsSync(resolveEvidencePath(dir))).toBe(false);
+  });
+  it('tool rejects partial bad entries instead of silently dropping', async () => {
+    const { loadEvidence } = await import('../src/evidence.js');
+    const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-qe3b-'));
+    const defs = await toolDefs(dir);
+    await byName(defs, 'goal_set').execute({ title: 'base' }, {});
+    const badFile = await byName(defs, 'goal_evidence').execute(
+      { ...good, files: ['src/a.ts', 42] },
+      {},
+    );
+    expect(badFile.content).toContain('Invalid');
+    const badTest = await byName(defs, 'goal_evidence').execute(
+      { ...good, tests: [{ command: '', exitCode: 0 }] },
+      {},
+    );
+    expect(badTest.content).toContain('Invalid');
+    expect(await loadEvidence(dir)).toBeNull();
+  });
+  it('tool trims spaced file entries to match the slash lane', async () => {
+    const { loadEvidence } = await import('../src/evidence.js');
+    const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-qe4-'));
+    const defs = await toolDefs(dir);
+    await byName(defs, 'goal_set').execute({ title: 'base' }, {});
+    const out = await byName(defs, 'goal_evidence').execute(
+      { ...good, files: ['  src/a.ts  '] },
+      {},
+    );
+    expect(out.content).toContain('Criterion recorded');
+    expect((await loadEvidence(dir))?.criteria[0].files).toEqual(['src/a.ts']);
+  });
+  it('fabricated file citation cannot complete', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-qe5-'));
+    const defs = await toolDefs(dir);
+    await byName(defs, 'goal_set').execute({ title: 'fake' }, {});
+    const rec = await byName(defs, 'goal_evidence').execute(
+      { ...good, files: ['src/does-not-exist.ts'] },
+      {},
+    );
+    expect(rec.content).toContain('Criterion recorded');
+    const done = await byName(defs, 'goal_complete').execute({}, {});
+    expect(done.content).not.toContain('Goal marked complete');
+    expect(done.content).toContain('blocked');
+  });
+  it('evidence after complete rejects with no second write', async () => {
+    const { writeFileSync } = await import('node:fs');
+    const { loadEvidence } = await import('../src/evidence.js');
+    const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-qe6-'));
+    writeFileSync(path.join(dir, 'proof.txt'), 'done\n');
+    const defs = await toolDefs(dir);
+    await byName(defs, 'goal_set').execute({ title: 'fin' }, {});
+    await byName(defs, 'goal_evidence').execute(
+      {
+        ...good,
+        id: 'e1',
+        files: ['proof.txt'],
+      },
+      {},
+    );
+    expect((await byName(defs, 'goal_complete').execute({}, {})).content).toBe(
+      'Goal marked complete.',
+    );
+    const late = await byName(defs, 'goal_evidence').execute(
+      { ...good, id: 'e2' },
+      {},
+    );
+    expect(late.content).toContain('Only an active goal');
+    expect((await loadEvidence(dir))?.criteria.length).toBe(1);
   });
 });
