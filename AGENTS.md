@@ -62,3 +62,9 @@ You MUST read this AGENTS.md first before any execution. Inside it, route to DES
 - **Runtime-State gitignore:** Per-project runtime state MUST be gitignored; deliberate config MUST NOT be gitignored. `.opencode/smart-compact.jsonc` is agent tooling, never runtime state, never gitignored. `tasks/.sessions/` transcript dirs MUST be gitignored when the dir exists.
 - **Goal Plugin Runtime State:** `[PROJECT_ROOT]/.opencode/goal-state.json`, `[PROJECT_ROOT]/.opencode/goal-evidence.json`, `[PROJECT_ROOT]/STOP_GOAL`, `[PROJECT_ROOT]/.opencode/STOP_GOAL` are runtime state only and MUST be gitignored. External scratch, never replaces task truth.
 - **Living Folder Docs Sibling Inspection:** Inspect sibling README.md and DECISIONS.md before editing code in any component or vertical slice directory, and update them when domain contracts or architectural decisions change.
+- **Edit Tool Discipline:** File edits use ONLY native file-editing tools (edit for replacements, file-write tools for new files). Using python, shell, heredoc, `sed -i`, or any script to create or modify files is strictly forbidden. Shell stays read-only for file content (grep, cat, diff, ls, git status). A non-unique anchor must fail loudly, never be forced. Verify every edit with grep/diff. See `docs/conventions.md`.
+- **Project Skills Table (local skills):** This project defines no local skills (no `.opencode/skills/` directory; `.opencode/` holds only goal runtime state). On any audit, rescan and rebuild this table if local skills appear.
+
+  | Skill | Trigger | Duty |
+  | ----- | ------- | ---- |
+  | _(none)_ | No local skill directory exists | Nothing to load; global registry matrix applies |
