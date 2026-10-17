@@ -1,4 +1,5 @@
 node_modules/
+dist/
 .opencode/goal-state.json
 .opencode/goal-evidence.json
 STOP_GOAL

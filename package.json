@@ -4,20 +4,21 @@
   "description": "Slash goal with file state for OpenCode V2 Phase 1",
   "license": "MIT",
   "type": "module",
-  "module": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "files": ["dist", "commands", "README.md", "LICENSE", "CHANGELOG.md", "opencode.json"],
+  "module": "./src/index.ts",
+  "types": "./src/index.ts",
+  "files": ["src", "commands", "README.md", "LICENSE", "CHANGELOG.md", "opencode.json"],
   "exports": {
     ".": {
-      "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "import": "./src/index.ts",
+      "types": "./src/index.ts"
     }
   },
   "scripts": {
     "compile": "tsup src/index.ts --format esm --dts --out-dir dist",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --no-color",
-    "format": "prettier --check src tests"
+    "format": "prettier --check src tests",
+    "prepublishOnly": "npm run typecheck && npm test"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",
