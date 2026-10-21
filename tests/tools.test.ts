@@ -183,7 +183,7 @@ describe('tool execute parity with slash', () => {
       { sessionID: 'sess-1' },
     );
     expect(out.content).toContain('Goal set to active');
-    const state = await loadGoalState(resolveStatePath(dir));
+    const state = await loadGoalState(resolveStatePath(dir, 'sess-1'));
     expect(state?.status).toBe('active');
     expect(state?.objective).toBe('block foo');
   });
@@ -199,9 +199,9 @@ describe('tool execute parity with slash', () => {
     expect(state?.status).toBe('active');
     expect(state?.objective).toBe(evil);
   });
-  it('different sessionIDs share one project goal without bleed', async () => {
-    // Single-goal-per-project semantics: sequential writes are consistent,
-    // last writer wins, and neither call throws or corrupts state.
+  it('different sessionIDs get isolated goals without bleed', async () => {
+    // Per-session isolation: each lane owns its file, last writer no longer
+    // clobbers the other lane. A sees only A's goal, B only B's.
     const { loadGoalState, resolveStatePath } = await import('../src/state.js');
     const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-sess-'));
     const defs = await toolDefs(dir);
@@ -215,8 +215,10 @@ describe('tool execute parity with slash', () => {
     );
     expect(a.content).toContain('Goal set to active');
     expect(b.content).toContain('Goal set to active');
-    const state = await loadGoalState(resolveStatePath(dir));
-    expect(state?.objective).toBe('from sess-B');
+    const stateA = await loadGoalState(resolveStatePath(dir, 'sess-A'));
+    const stateB = await loadGoalState(resolveStatePath(dir, 'sess-B'));
+    expect(stateA?.objective).toBe('from sess-A');
+    expect(stateB?.objective).toBe('from sess-B');
   });
   it('projects stay isolated from each other', async () => {
     const { loadGoalState, resolveStatePath } = await import('../src/state.js');
@@ -235,8 +237,11 @@ describe('tool execute parity with slash', () => {
     const clock = new FakeClock();
     const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-race-'));
     const defs = await toolDefs(dir);
-    await byName(defs, 'goal_set').execute({ title: 'baseline' }, {});
-    const statePath = resolveStatePath(dir);
+    await byName(defs, 'goal_set').execute(
+      { title: 'baseline' },
+      { sessionID: 'sess-race' },
+    );
+    const statePath = resolveStatePath(dir, 'sess-race');
     const before = readFileSync(statePath, 'utf8');
     const held = await tryClaimLease(statePath, 'loop', LEASE_TTL_MS, clock);
     expect(held.claimed).toBe(true);
@@ -332,7 +337,10 @@ describe('goal_evidence sole writer', () => {
     const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-evok-'));
     writeFileSync(path.join(dir, 'proof.txt'), 'done\n');
     const defs = await toolDefs(dir);
-    await byName(defs, 'goal_set').execute({ title: 'prove it' }, {});
+    await byName(defs, 'goal_set').execute(
+      { title: 'prove it' },
+      { sessionID: 'sess-ev' },
+    );
     const rec = await byName(defs, 'goal_evidence').execute(
       {
         id: 'e1',
@@ -343,9 +351,12 @@ describe('goal_evidence sole writer', () => {
       { sessionID: 'sess-ev' },
     );
     expect(rec.content).toContain('Criterion recorded for e1');
-    const ev = await loadEvidence(dir);
+    const ev = await loadEvidence(dir, 'sess-ev');
     expect(ev?.criteria.map((c) => c.id)).toEqual(['e1']);
-    const done = await byName(defs, 'goal_complete').execute({}, {});
+    const done = await byName(defs, 'goal_complete').execute(
+      {},
+      { sessionID: 'sess-ev' },
+    );
     expect(done.content).toBe('Goal marked complete.');
   });
   it('hostile shape writes nothing', async () => {
@@ -387,9 +398,12 @@ describe('goal_evidence sole writer', () => {
     const clock = new FakeClock();
     const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-evrace-'));
     const defs = await toolDefs(dir);
-    await byName(defs, 'goal_set').execute({ title: 'baseline' }, {});
+    await byName(defs, 'goal_set').execute(
+      { title: 'baseline' },
+      { sessionID: 'sess-race' },
+    );
     const held = await tryClaimLease(
-      resolveStatePath(dir),
+      resolveStatePath(dir, 'sess-race'),
       'loop',
       LEASE_TTL_MS,
       clock,
@@ -405,7 +419,7 @@ describe('goal_evidence sole writer', () => {
       { sessionID: 'sess-race' },
     );
     expect(out.content).toMatch(/busy|lease|Busy/i);
-    expect(existsSync(resolveEvidencePath(dir))).toBe(false);
+    expect(existsSync(resolveEvidencePath(dir, 'sess-race'))).toBe(false);
   });
   it('blocked goal rejects evidence with no write', async () => {
     const { existsSync } = await import('node:fs');

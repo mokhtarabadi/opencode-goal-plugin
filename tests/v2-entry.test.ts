@@ -75,7 +75,7 @@ describe('v2 setup wiring', () => {
       sessionID: 's1',
       prompt: { text: 'ship v2 entry' },
     });
-    const state = await loadGoalState(resolveStatePath(dir));
+    const state = await loadGoalState(resolveStatePath(dir, 's1'));
     expect(state?.objective).toBe('ship v2 entry');
     expect(state?.status).toBe('active');
     (cleanup as () => void)();

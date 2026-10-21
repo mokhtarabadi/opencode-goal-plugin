@@ -6,6 +6,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
+import { sanitizeSessionId } from './state.js';
 
 /** Version of the evidence sidecar format. */
 export const EVIDENCE_VERSION = 1 as const;
@@ -38,12 +39,33 @@ export interface GoalEvidenceFile {
 }
 
 /**
- * Resolve evidence sidecar path for a project directory.
+ * Resolve legacy (pre-isolation) evidence sidecar path for a project directory.
  * @param projectDir absolute project root
+ * @returns absolute legacy evidence file path
+ */
+export function resolveLegacyEvidencePath(projectDir: string): string {
+  return path.join(projectDir, '.opencode', EVIDENCE_FILE_NAME);
+}
+
+/**
+ * Resolve evidence sidecar path for a project directory, scoped per session.
+ * Old callers pass projectDir only and keep the legacy path.
+ * @param projectDir absolute project root
+ * @param sessionId optional session lane id; empty or missing means legacy
  * @returns absolute evidence file path
  */
-export function resolveEvidencePath(projectDir: string): string {
-  return path.join(projectDir, '.opencode', EVIDENCE_FILE_NAME);
+export function resolveEvidencePath(
+  projectDir: string,
+  sessionId?: string | null,
+): string {
+  const t = typeof sessionId === 'string' ? sessionId.trim() : '';
+  if (t.length === 0) return resolveLegacyEvidencePath(projectDir);
+  return path.join(
+    projectDir,
+    '.opencode',
+    'goals',
+    sanitizeSessionId(t) + '.evidence.json',
+  );
 }
 
 /**
@@ -98,37 +120,52 @@ export function hashEvidence(ev: GoalEvidenceFile): string {
 
 /**
  * Load evidence sidecar, returning null when absent or invalid.
+ * Scoped first with legacy fallback so old sidecars migrate on next write.
  * @param projectDir absolute project root
+ * @param sessionId optional session lane id; empty or missing means legacy
  */
 export async function loadEvidence(
   projectDir: string,
+  sessionId?: string | null,
 ): Promise<GoalEvidenceFile | null> {
-  try {
-    const raw = await fs.readFile(resolveEvidencePath(projectDir), 'utf8');
-    const parsed: unknown = JSON.parse(raw);
-    const shape = validateEvidenceShape(parsed);
-    if (!shape.ok) return null;
-    return parsed as GoalEvidenceFile;
-  } catch (e: unknown) {
-    // ENOENT means no evidence yet; anything else also maps to null so callers stay total.
-    const code = (e as { code?: string }).code;
-    if (code === 'ENOENT') return null;
-    return null;
-  }
+  const t = typeof sessionId === 'string' ? sessionId.trim() : '';
+  const scoped = resolveEvidencePath(projectDir, sessionId);
+  const legacy = resolveLegacyEvidencePath(projectDir);
+  const readOne = async (p: string): Promise<GoalEvidenceFile | null> => {
+    try {
+      const raw = await fs.readFile(p, 'utf8');
+      const parsed: unknown = JSON.parse(raw);
+      const shape = validateEvidenceShape(parsed);
+      if (!shape.ok) return null;
+      return parsed as GoalEvidenceFile;
+    } catch (e: unknown) {
+      // ENOENT means no evidence yet; anything else also maps to null so callers stay total.
+      const code = (e as { code?: string }).code;
+      if (code === 'ENOENT') return null;
+      return null;
+    }
+  };
+  if (scoped === legacy || t.length === 0) return readOne(legacy);
+  const hit = await readOne(scoped);
+  if (hit !== null) return hit;
+  return readOne(legacy);
 }
 
 /**
  * Save evidence sidecar atomically via tmp plus rename with durability.
  * Why hardening exists: evidence is the second leg of completion proof.
  * Fsync plus chmod mirrors state durability so a crash cannot hollow proof.
+ * Scoped saves never write back to the legacy path (migrate-on-write).
  * @param projectDir absolute project root
  * @param ev evidence to persist
+ * @param sessionId optional session lane id; empty or missing means legacy
  */
 export async function saveEvidence(
   projectDir: string,
   ev: GoalEvidenceFile,
+  sessionId?: string | null,
 ): Promise<void> {
-  const target = resolveEvidencePath(projectDir);
+  const target = resolveEvidencePath(projectDir, sessionId);
   await fs.mkdir(path.dirname(target), { recursive: true });
   // Unique tmp per call so parallel savers never share a tmp file.
   evidenceTmpCounter += 1;

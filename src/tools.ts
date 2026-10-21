@@ -15,7 +15,9 @@ import type { Clock, GoalState } from './state.js';
 import {
   LEASE_TTL_MS,
   loadGoalState,
+  loadGoalStateWithFallback,
   releaseLease,
+  resolveLegacyStatePath,
   resolveStatePath,
   saveGoalState,
   tryClaimLease,
@@ -102,11 +104,24 @@ const BUSY_MESSAGE = 'Goal is busy with another turn. Retry shortly.';
  */
 async function claimForTool(
   statePath: string,
+  legacyPath: string,
   current: GoalState | null,
   owner: string,
   clock: Clock,
 ): Promise<{ claimed: boolean }> {
   if (current === null) return { claimed: true };
+  // First write to a missing scoped file needs no lease: no file to race.
+  // Why scoped check matters: fallback may have loaded legacy content while
+  // the scoped path is still absent. Claiming the absent path would fail
+  // closed (tryClaimLease returns false on null) and wrongly report busy.
+  if (statePath !== legacyPath) {
+    try {
+      const scoped = await loadGoalState(statePath);
+      if (scoped === null) return { claimed: true };
+    } catch {
+      // Corrupt scoped fails closed below via tryClaimLease path.
+    }
+  }
   try {
     const res = await tryClaimLease(statePath, owner, LEASE_TTL_MS, clock);
     return { claimed: res.claimed };
@@ -134,13 +149,33 @@ async function releaseToolLease(
 }
 
 /**
- * Load current state, mapping corruption to the shared message.
+ * Map a lane id to a storage session: host-less markers stay on legacy.
+ * Why this helper exists: toolSessionId returns 'unknown' when the host omits
+ * the session, and the slash lane historically passed 'slash' as the lane.
+ * Neither is a real session, so both map to legacy (undefined) to keep old
+ * callers green. Real session ids pass through to per-session files.
+ * @param sessionID lane id from toolSessionId or slash wiring
+ */
+function storageSessionFor(sessionID: string): string | undefined {
+  const t = typeof sessionID === 'string' ? sessionID.trim() : '';
+  if (t === '' || t === 'unknown' || t === 'slash') return undefined;
+  return t;
+}
+
+/**
+ * Load current state with legacy fallback, mapping corruption to the message.
+ * Scoped missing plus legacy present returns legacy content; next save lands
+ * scoped (migrate-on-write). Corrupt scoped fails closed without fallback.
  */
 async function loadForTool(
   statePath: string,
+  legacyPath: string,
 ): Promise<{ state: GoalState | null } | { error: string }> {
   try {
-    return { state: await loadGoalState(statePath) };
+    if (statePath === legacyPath)
+      return { state: await loadGoalState(statePath) };
+    // Corrupt scoped throws inside and maps to the corrupt message below.
+    return { state: await loadGoalStateWithFallback(statePath, legacyPath) };
   } catch {
     return { error: corruptMessage(statePath) };
   }
@@ -168,11 +203,19 @@ async function toolSet(
   if (!isSafeGoalTitle(title)) {
     return 'Invalid /goal usage. Objective must not be a path escape.';
   }
-  const statePath = resolveStatePath(projectDir);
-  const loaded = await loadForTool(statePath);
+  const storage = storageSessionFor(sessionID);
+  const statePath = resolveStatePath(projectDir, storage);
+  const legacyPath = resolveLegacyStatePath(projectDir);
+  const loaded = await loadForTool(statePath, legacyPath);
   if ('error' in loaded) return loaded.error;
   const owner = 'tool:' + sessionID;
-  const claim = await claimForTool(statePath, loaded.state, owner, clock);
+  const claim = await claimForTool(
+    statePath,
+    legacyPath,
+    loaded.state,
+    owner,
+    clock,
+  );
   if (!claim.claimed) return BUSY_MESSAGE;
   try {
     const next = setObjective(loaded.state, title, clock, TOOL_HOST_VERSION);
@@ -203,14 +246,22 @@ async function toolBlock(
   ) {
     return 'Invalid usage. Provide a reason string.';
   }
-  const statePath = resolveStatePath(projectDir);
-  const loaded = await loadForTool(statePath);
+  const storage = storageSessionFor(sessionID);
+  const statePath = resolveStatePath(projectDir, storage);
+  const legacyPath = resolveLegacyStatePath(projectDir);
+  const loaded = await loadForTool(statePath, legacyPath);
   if ('error' in loaded) return loaded.error;
   if (loaded.state === null) {
     return 'No goal set. Use /goal <objective> first.';
   }
   const owner = 'tool:' + sessionID;
-  const claim = await claimForTool(statePath, loaded.state, owner, clock);
+  const claim = await claimForTool(
+    statePath,
+    legacyPath,
+    loaded.state,
+    owner,
+    clock,
+  );
   if (!claim.claimed) return BUSY_MESSAGE;
   try {
     let next: GoalState;
@@ -248,12 +299,15 @@ async function toolBlock(
  * @param clock injected clock
  * @param input raw tool input with id, claim, files, tests
  * @param sessionID lane id for the lease owner
+ * @param storageSessionId optional real session for storage scope (slash lane
+ * passes its invocation sessionID here; defaults to sessionID)
  */
 export async function recordEvidence(
   projectDir: string,
   clock: Clock,
   input: unknown,
   sessionID: string,
+  storageSessionId?: string | null,
 ): Promise<string> {
   const raw = input as {
     id?: unknown;
@@ -319,8 +373,13 @@ export async function recordEvidence(
   ) {
     return 'Invalid /goal evidence usage. Provide id=<id> claim=<claim> files=<a,b> tests=<cmd:exitCode>.';
   }
-  const statePath = resolveStatePath(projectDir);
-  const loaded = await loadForTool(statePath);
+  const storage =
+    typeof storageSessionId === 'string' && storageSessionId.trim() !== ''
+      ? storageSessionFor(storageSessionId)
+      : storageSessionFor(sessionID);
+  const statePath = resolveStatePath(projectDir, storage);
+  const legacyPath = resolveLegacyStatePath(projectDir);
+  const loaded = await loadForTool(statePath, legacyPath);
   if ('error' in loaded) return loaded.error;
   if (loaded.state === null) {
     return 'No goal set. Use /goal <objective> first.';
@@ -333,11 +392,19 @@ export async function recordEvidence(
     );
   }
   const owner = 'tool:' + sessionID;
-  const claimRes = await claimForTool(statePath, loaded.state, owner, clock);
+  const claimRes = await claimForTool(
+    statePath,
+    legacyPath,
+    loaded.state,
+    owner,
+    clock,
+  );
   if (!claimRes.claimed) return BUSY_MESSAGE;
   try {
     // Null sidecar (e.g. tool-lane set never seeded one) starts empty.
-    const current = (await loadEvidence(projectDir)) ?? emptyEvidence(0);
+    // Scoped evidence: slash plus tool lanes never share citations.
+    const current =
+      (await loadEvidence(projectDir, storage)) ?? emptyEvidence(0);
     if (current.criteria.some((c) => c.id === id)) {
       return 'Evidence id already recorded: ' + id + '.';
     }
@@ -363,7 +430,7 @@ export async function recordEvidence(
       return 'Invalid evidence shape: ' + shape.reason + '.';
     }
     try {
-      await saveEvidence(projectDir, candidate);
+      await saveEvidence(projectDir, candidate, storage);
     } catch (err) {
       return 'Failed to save evidence: ' + (err as Error).message;
     }
@@ -384,14 +451,22 @@ async function toolComplete(
   clock: Clock,
   sessionID: string,
 ): Promise<string> {
-  const statePath = resolveStatePath(projectDir);
-  const loaded = await loadForTool(statePath);
+  const storage = storageSessionFor(sessionID);
+  const statePath = resolveStatePath(projectDir, storage);
+  const legacyPath = resolveLegacyStatePath(projectDir);
+  const loaded = await loadForTool(statePath, legacyPath);
   if ('error' in loaded) return loaded.error;
   if (loaded.state === null) {
     return 'No goal set. Use /goal <objective> first.';
   }
   const owner = 'tool:' + sessionID;
-  const claim = await claimForTool(statePath, loaded.state, owner, clock);
+  const claim = await claimForTool(
+    statePath,
+    legacyPath,
+    loaded.state,
+    owner,
+    clock,
+  );
   if (!claim.claimed) return BUSY_MESSAGE;
   try {
     let next: GoalState;
@@ -405,7 +480,7 @@ async function toolComplete(
       );
     }
     try {
-      const ev = await loadEvidence(projectDir);
+      const ev = await loadEvidence(projectDir, storage);
       const check = await tryCompleteWithEvidence({
         projectDir,
         evidence: ev,
@@ -439,14 +514,22 @@ async function toolResume(
   clock: Clock,
   sessionID: string,
 ): Promise<string> {
-  const statePath = resolveStatePath(projectDir);
-  const loaded = await loadForTool(statePath);
+  const storage = storageSessionFor(sessionID);
+  const statePath = resolveStatePath(projectDir, storage);
+  const legacyPath = resolveLegacyStatePath(projectDir);
+  const loaded = await loadForTool(statePath, legacyPath);
   if ('error' in loaded) return loaded.error;
   if (loaded.state === null) {
     return 'No goal set. Use /goal <objective> first.';
   }
   const owner = 'tool:' + sessionID;
-  const claim = await claimForTool(statePath, loaded.state, owner, clock);
+  const claim = await claimForTool(
+    statePath,
+    legacyPath,
+    loaded.state,
+    owner,
+    clock,
+  );
   if (!claim.claimed) return BUSY_MESSAGE;
   try {
     let resumed: GoalState;

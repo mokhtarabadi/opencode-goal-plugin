@@ -292,10 +292,23 @@ export async function handleSessionFailure(
   ) {
     return { decision: 'stopped', reason: 'invalid-deps' };
   }
-  const statePath = resolveStatePath(ctx.projectDir);
+  const storage =
+    typeof ctx.sessionId === 'string' && ctx.sessionId.trim().length > 0
+      ? ctx.sessionId.trim()
+      : undefined;
+  const statePath = resolveStatePath(ctx.projectDir, storage);
+  const legacyPath = resolveStatePath(ctx.projectDir);
   let current: GoalState | null;
   try {
     current = await deps.loadState(statePath);
+    // Scoped missing plus legacy present: migrate old users exactly once.
+    if (current === null && statePath !== legacyPath) {
+      try {
+        current = await deps.loadState(legacyPath);
+      } catch {
+        current = null;
+      }
+    }
   } catch {
     return { decision: 'stopped', reason: 'corrupt-state' };
   }
@@ -630,10 +643,23 @@ export async function handleSessionIdle(
   activeContinueTokens.set(tokenKey, myToken);
   idleInFlight = true;
   try {
-    const statePath = resolveStatePath(ctx.projectDir);
+    // Scoped storage: an idle tick in B loads only B's file, never A's.
+    const idleStorage =
+      typeof ctx.sessionId === 'string' && ctx.sessionId.trim().length > 0
+        ? ctx.sessionId.trim()
+        : undefined;
+    const statePath = resolveStatePath(ctx.projectDir, idleStorage);
+    const legacyPath = resolveStatePath(ctx.projectDir);
     let current: GoalState | null;
     try {
       current = await deps.loadState(statePath);
+      if (current === null && statePath !== legacyPath) {
+        try {
+          current = await deps.loadState(legacyPath);
+        } catch {
+          current = null;
+        }
+      }
     } catch {
       return { decision: 'stopped', reason: 'corrupt-state' };
     }

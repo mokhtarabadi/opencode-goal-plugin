@@ -10,6 +10,8 @@ import { Plugin } from '@opencode/plugin';
 import {
   SystemClock,
   loadGoalState,
+  loadGoalStateWithFallback,
+  resolveLegacyStatePath,
   resolveStatePath,
   saveGoalState,
   tryClaimLease,
@@ -101,6 +103,7 @@ export async function handleGoalCommand(
   projectDir: string,
   clock: Clock = new SystemClock(),
   hostVersion: string = '2.0.29',
+  sessionId?: string | null,
 ): Promise<string> {
   // Type guards first: a misbehaving host gets a message, never a TypeError.
   if (typeof rawInput !== 'string') {
@@ -114,10 +117,18 @@ export async function handleGoalCommand(
   if (parsed.kind === 'invalid') {
     return 'Invalid /goal usage. Try /goal <objective> or /goal status.';
   }
-  const statePath = resolveStatePath(projectDir);
+  const storage =
+    typeof sessionId === 'string' && sessionId.trim() !== ''
+      ? sessionId.trim()
+      : undefined;
+  const statePath = resolveStatePath(projectDir, storage);
+  const legacyPath = resolveLegacyStatePath(projectDir);
   let current: GoalState | null;
   try {
-    current = await loadGoalState(statePath);
+    current =
+      statePath === legacyPath
+        ? await loadGoalState(statePath)
+        : await loadGoalStateWithFallback(statePath, legacyPath);
   } catch {
     // Corrupt JSON or shape mismatch: point at the file, do not throw.
     return (
@@ -181,6 +192,7 @@ export async function handleGoalCommand(
   if (parsed.kind === 'evidence') {
     // Parity by construction: the slash lane calls the tool handler directly,
     // so validation plus lease plus messages cannot drift between lanes.
+    // Storage scope is the real session; the lease lane stays 'slash'.
     return await recordEvidence(
       projectDir,
       clock,
@@ -191,6 +203,7 @@ export async function handleGoalCommand(
         tests: parsed.tests,
       },
       'slash',
+      storage ?? null,
     );
   }
   if (parsed.kind === 'complete') {
@@ -208,8 +221,9 @@ export async function handleGoalCommand(
       );
     }
     // Active path now requires evidence: missing proof blocks with friendly text.
+    // Scoped evidence: a session completes only on its own citations.
     try {
-      const ev = await loadEvidence(projectDir);
+      const ev = await loadEvidence(projectDir, storage);
       const check = await tryCompleteWithEvidence({
         projectDir,
         evidence: ev,
@@ -379,6 +393,7 @@ export function registerIdleHandler(
 export interface RegisterCompactionOptions {
   projectDir: string;
   clock?: Clock;
+  sessionId?: string | null;
 }
 
 /**
@@ -425,7 +440,11 @@ export function registerCompactionHandler(
       return { registered: false, reason: 'compaction-hook-unavailable' };
     }
     const clock = opts.clock ?? new SystemClock();
-    const statePath = resolveStatePath(opts.projectDir);
+    const storage =
+      typeof opts.sessionId === 'string' && opts.sessionId.trim() !== ''
+        ? opts.sessionId.trim()
+        : undefined;
+    const statePath = resolveStatePath(opts.projectDir, storage);
     const store = { loadState: loadGoalState, saveState: saveGoalState };
     // Snapshot flushes hot state to disk before compaction wipes memory.
     if (hasCompact && typeof h.onCompact === 'function') {
@@ -600,10 +619,14 @@ export default Plugin.define({
                     }
                     return;
                   }
-                  const statePath = resolveStatePath(projectDir);
-                  const current = await loadGoalState(statePath).catch(
-                    () => null,
-                  );
+                  const storage = sessionID !== '' ? sessionID : undefined;
+                  const statePath = resolveStatePath(projectDir, storage);
+                  const legacyPath = resolveLegacyStatePath(projectDir);
+                  const current = await (
+                    statePath === legacyPath
+                      ? loadGoalState(statePath)
+                      : loadGoalStateWithFallback(statePath, legacyPath)
+                  ).catch(() => null);
                   const next = setObjective(
                     current,
                     parsed.objective,
@@ -612,9 +635,11 @@ export default Plugin.define({
                   );
                   await saveGoalState(statePath, next);
                   // Seed evidence shell so completion checks have a file from turn one.
+                  // Scoped seed: sessions never share citations.
                   await saveEvidence(
                     projectDir,
                     emptyEvidence(clock.nowMs()),
+                    storage,
                   ).catch(() => undefined);
                   if (sessionID !== '') {
                     await (
@@ -634,10 +659,13 @@ export default Plugin.define({
                   return;
                 }
                 // Status, block, complete, and clear reuse the guarded handler, then report.
+                // Real session threads through so B never touches A's goal.
                 const message = await handleGoalCommand(
                   '/goal ' + text,
                   projectDir,
                   clock,
+                  '2.0.29',
+                  sessionID !== '' ? sessionID : undefined,
                 );
                 if (sessionID !== '') {
                   const session = (
@@ -860,28 +888,66 @@ export default Plugin.define({
       }
     })();
 
-    // Session-start resume: rearm any outstanding retry from file state.
-    // Why no immediate send: a blind resume would bypass the lease and the
-    // 20s cooldown. Rearm only, so the watchdog performs the guarded retry.
-    void loadGoalState(resolveStatePath(projectDir))
-      .then((st) => {
-        if (st === null || st.status !== 'active') return;
-        if (st.pendingAttempt === null) return;
-        // Rearm the exact last real session. A missing id means no lane is
-        // known yet, so skip: the next real event will rearm correctly.
-        const lane =
-          typeof st.lastSessionId === 'string' && st.lastSessionId.length > 0
-            ? st.lastSessionId
-            : '';
-        if (lane === '') return;
-        rearmFromState(projectDir, lane, st, clock, async () => {
-          await handleSessionIdle(
-            { projectDir, lastMessageId: null, sessionId: lane },
-            buildIdleDeps(lane),
-          );
-        });
-      })
-      .catch(() => undefined);
+    // Session-start resume: rearm outstanding retries from file state.
+    // Why scan instead of one file: per-session files each own their lane, so
+    // a global lastSessionId would reintroduce the leak. Best-effort only.
+    void (async () => {
+      try {
+        // Legacy single file keeps its old lane behavior for old users.
+        await loadGoalState(resolveStatePath(projectDir))
+          .then((st) => {
+            if (st === null || st.status !== 'active') return;
+            if (st.pendingAttempt === null) return;
+            const lane =
+              typeof st.lastSessionId === 'string' &&
+              st.lastSessionId.length > 0
+                ? st.lastSessionId
+                : '';
+            if (lane === '') return;
+            rearmFromState(projectDir, lane, st, clock, async () => {
+              await handleSessionIdle(
+                { projectDir, lastMessageId: null, sessionId: lane },
+                buildIdleDeps(lane),
+              );
+            });
+          })
+          .catch(() => undefined);
+        // Scoped files: rearm each lane with a pending retry.
+        const { promises: fsp } = await import('node:fs');
+        const goalsDir = (await import('node:path')).join(
+          projectDir,
+          '.opencode',
+          'goals',
+        );
+        let names: string[] = [];
+        try {
+          names = await fsp.readdir(goalsDir);
+        } catch {
+          return;
+        }
+        for (const n of names) {
+          if (!n.endsWith('.json') || n.endsWith('.evidence.json')) continue;
+          if (n.includes('.lock')) continue;
+          const lane = n.slice(0, -'.json'.length);
+          if (!/^[A-Za-z0-9_-]{1,64}$|^sid-[0-9a-f]{8}$/.test(lane)) continue;
+          try {
+            const st = await loadGoalState(resolveStatePath(projectDir, lane));
+            if (st === null || st.status !== 'active') continue;
+            if (st.pendingAttempt === null) continue;
+            rearmFromState(projectDir, lane, st, clock, async () => {
+              await handleSessionIdle(
+                { projectDir, lastMessageId: null, sessionId: lane },
+                buildIdleDeps(lane),
+              );
+            });
+          } catch {
+            // One bad scoped file never blocks the rest.
+          }
+        }
+      } catch {
+        // Startup rearm is best-effort.
+      }
+    })();
 
     // Compaction survival: re-inject the goal summary from file state, never send.
     try {
@@ -907,7 +973,8 @@ export default Plugin.define({
                 // Prune failure never blocks compaction; live stays registered.
                 idleAbortControllers.add(controller);
               }
-              void loadGoalState(resolveStatePath(projectDir))
+              // Scoped restore: a session resumes only its own goal, never another's.
+              void loadGoalState(resolveStatePath(projectDir, e.sessionID))
                 .then((state) => {
                   if (state === null || state.status !== 'active') return;
                   if (!Array.isArray(e.messages)) return;
@@ -931,8 +998,11 @@ export default Plugin.define({
         await session
           .hook('context', (event: unknown) => {
             try {
-              const e = event as { system?: unknown };
-              void loadGoalState(resolveStatePath(projectDir))
+              const e = event as { system?: unknown; sessionID?: unknown };
+              // Fail closed: without a session id we inject nothing, so B can
+              // never see A's goal through a session-less context event.
+              if (typeof e.sessionID !== 'string' || e.sessionID === '') return;
+              void loadGoalState(resolveStatePath(projectDir, e.sessionID))
                 .then((state) => {
                   if (state === null || state.status !== 'active') return;
                   if (!Array.isArray(e.system)) return;

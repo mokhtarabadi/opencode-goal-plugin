@@ -91,14 +91,90 @@ export interface GoalState {
 
 export const STATE_FILENAME = 'goal-state.json';
 export const LEASE_TTL_MS = 120000;
+export const SESSION_STATE_DIR = 'goals';
 
 /**
- * Resolve state file path inside project dir.
+ * Sanitize a session id into a safe filename stem.
+ * Why this helper exists: session ids come from the host and must never
+ * escape the goals dir via traversal. Strict allowlist keeps isolation safe.
+ * Trims, allows 1..64 of [A-Za-z0-9_-], else stable FNV-1a hash with sid- prefix.
+ * @param raw unknown session id value
+ */
+export function sanitizeSessionId(raw: unknown): string {
+  const t = typeof raw === 'string' ? raw.trim() : '';
+  if (/^[A-Za-z0-9_-]{1,64}$/.test(t)) return t;
+  // FNV-1a 32-bit over the raw string: stable, dependency-free, 8 hex chars.
+  let h = 0x811c9dc5;
+  const s = typeof raw === 'string' ? raw : String(raw);
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return 'sid-' + (h >>> 0).toString(16).padStart(8, '0');
+}
+
+/**
+ * Resolve legacy (pre-isolation) state file path inside project dir.
+ * Why kept: existing users own one shared file; fallback reads it once.
  * @param projectDir project root containing .opencode dir
  */
-export function resolveStatePath(projectDir: string): string {
+export function resolveLegacyStatePath(projectDir: string): string {
   // Inline path join keeps storage layout explicit and testable.
   return path.join(projectDir, '.opencode', STATE_FILENAME);
+}
+
+/**
+ * Resolve state file path inside project dir, scoped per session when given.
+ * Why optional session exists: old callers pass projectDir only and keep the
+ * legacy path, so existing tests stay green. New lanes pass the real session
+ * id and get an isolated file under .opencode/goals/.
+ * @param projectDir project root containing .opencode dir
+ * @param sessionId optional session lane id; empty or missing means legacy
+ */
+export function resolveStatePath(
+  projectDir: string,
+  sessionId?: string | null,
+): string {
+  const t = typeof sessionId === 'string' ? sessionId.trim() : '';
+  if (t.length === 0) return resolveLegacyStatePath(projectDir);
+  // Scoped file keeps storage layout explicit and testable.
+  return path.join(
+    projectDir,
+    '.opencode',
+    SESSION_STATE_DIR,
+    sanitizeSessionId(t) + '.json',
+  );
+}
+
+/**
+ * Load state with legacy fallback: scoped first, then legacy file once.
+ * Why fallback exists: single-file users migrate without losing an active goal.
+ * Corrupt scoped files fail closed (no fallback) so corruption never hides.
+ * Missing scoped plus present legacy returns legacy content; the next mutation
+ * saves to the scoped path, completing a migrate-on-write without races.
+ * @param scopedPath per-session state path
+ * @param legacyPath legacy shared state path
+ */
+export async function loadGoalStateWithFallback(
+  scopedPath: string,
+  legacyPath: string,
+): Promise<GoalState | null> {
+  // Same-file shortcut: legacy callers pass identical paths, single load.
+  if (scopedPath === legacyPath) return loadGoalState(scopedPath);
+  let scoped: GoalState | null;
+  try {
+    scoped = await loadGoalState(scopedPath);
+  } catch {
+    // Corrupt scoped file fails closed: never mask it with legacy content.
+    throw new Error('corrupt goal state at ' + scopedPath);
+  }
+  if (scoped !== null) return scoped;
+  // Scoped missing: one legacy read migrates old users exactly once.
+  try {
+    return await loadGoalState(legacyPath);
+  } catch {
+    throw new Error('corrupt goal state at ' + legacyPath);
+  }
 }
 
 /**
