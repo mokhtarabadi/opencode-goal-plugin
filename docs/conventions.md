@@ -6,7 +6,7 @@ This document defines syntax rules, naming conventions, file boundaries, and aut
 
 All projects in this ecosystem MUST follow these datetime rules:
 
-1. **UTC at Rest** — All databases and caches store datetimes in UTC with `TIMESTAMP WITH TIME ZONE`. This repo stores UTC epoch ms in `.opencode/goal-state.json`. Banned: naive or local-time storage.
+1. **UTC at Rest** — All databases and caches store datetimes in UTC with `TIMESTAMP WITH TIME ZONE`. This repo stores UTC epoch ms in per-session goal files at `.opencode/goals/<session-id>.json` (legacy `.opencode/goal-state.json` remains a read fallback). Banned: naive or local-time storage.
 2. **ISO-8601 with Offset / Epoch ms at API Boundaries** — APIs transmit datetimes as Unix Epoch milliseconds (int64) or ISO-8601 with offset (e.g., `2026-07-23T14:30:00+00:00`). Banned: timezone-naive strings.
 3. **Clock Injection** — All current-time access must go through an injectable `Clock` abstraction. This repo's `SystemClock` is the single `Date.now()` home in `src/state.ts`. Banned: direct `new Date()`, `datetime.now()`, `time.Now()` in business logic.
 4. **Dual-Representation for Future Events** — Calendar events expose both `event_start_local` (with timezone) and `event_start_epoch_ms` (absolute).

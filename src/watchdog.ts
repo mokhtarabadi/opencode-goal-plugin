@@ -1,3 +1,4 @@
+// Sibling Docs: src/README.md | Decisions: src/DECISIONS.md
 /**
  * Watchdog timer for the idle-never-arrives stall.
  * Why this module exists: the idle-only trigger cannot wake the loop when the

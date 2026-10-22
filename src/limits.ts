@@ -1,3 +1,4 @@
+// Sibling Docs: src/README.md | Decisions: src/DECISIONS.md
 /**
  * Budget limits Phase 2.
  * Why this module exists: bounds auto-continue so the idle loop cannot run forever.

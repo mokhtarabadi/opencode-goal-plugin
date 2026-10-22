@@ -1,3 +1,4 @@
+// Sibling Docs: src/README.md | Decisions: src/DECISIONS.md
 /**
  * Plugin entry: OpenCode V2 host binding.
  * Why this file exists: the host loader requires a default export shaped as
@@ -8,13 +9,17 @@ import * as path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { Plugin } from '@opencode/plugin';
 import {
+  LEASE_TTL_MS,
   SystemClock,
+  goalIdentity,
   loadGoalState,
   loadGoalStateWithFallback,
+  releaseLease,
   resolveLegacyStatePath,
   resolveStatePath,
   saveGoalState,
   tryClaimLease,
+  withClaimLock,
 } from './state.js';
 import type { Clock, GoalState } from './state.js';
 import {
@@ -42,6 +47,7 @@ import {
 } from './compaction.js';
 import { saveEvidence, emptyEvidence, loadEvidence } from './evidence.js';
 import { tryCompleteWithEvidence } from './verifier.js';
+import { PROOF_TOTAL_TIMEOUT_MS } from './proof.js';
 import { recordEvidence, registerGoalTools } from './tools.js';
 import {
   armWatchdog,
@@ -60,6 +66,27 @@ import {
 
 export const PLUGIN_NAME = 'opencode-goal-plugin';
 export const PLUGIN_VERSION = '0.2.0';
+
+/**
+ * Message when the state lease is already held by another lane.
+ * Why shared text: the slash and tool lanes must report contention identically.
+ */
+const BUSY_GOAL_MESSAGE = 'Goal is busy with another turn. Retry shortly.';
+
+/**
+ * Message when the goal identity changed during a long completion pass.
+ * Why a distinct string: the caller must retry against the new goal instead of
+ * treating the run as a failure of the old one.
+ */
+const STATE_CHANGED_MESSAGE =
+  'Goal state changed while completing. Run /goal status and retry.';
+
+/**
+ * Monotonic sequence for slash lease owners.
+ * Why this exists: the lease treats a repeated owner id as the same writer and
+ * lets it re-claim, so two concurrent slash calls must never share an owner.
+ */
+let slashOwnerSeq = 0;
 
 /** Minimal host shape, all fields optional so probing never throws. */
 export interface MinimalHost {
@@ -137,6 +164,92 @@ export async function handleGoalCommand(
       '. Back up the file then clear it.'
     );
   }
+  // One lease owner per operation, so two slash calls never look like the same
+  // writer (a repeated owner id would re-enter its own claim). A missing file
+  // needs no claim: there is nothing to race before the first write.
+  slashOwnerSeq += 1;
+  const slashOwner =
+    'slash:' +
+    (typeof storage === 'string' && storage.length > 0 ? storage : 'default') +
+    ':' +
+    String(slashOwnerSeq);
+  /**
+   * Run one slash mutation under the state lease.
+   * Why a helper: four branches share the claim, the busy message, and the
+   * release safety net, so the policy cannot drift between them.
+   * @param fn mutation body that reads fresh state and returns its message
+   */
+  const withSlashLease = async (fn: () => Promise<string>): Promise<string> => {
+    // No state file at all: still serialize the very first write with the lock.
+    if (current === null) {
+      const locked = await withClaimLock(
+        statePath,
+        slashOwner,
+        LEASE_TTL_MS,
+        clock,
+        fn,
+      );
+      if (!locked.ok) return BUSY_GOAL_MESSAGE;
+      return locked.value as string;
+    }
+    // First write to a scoped file: the lease cannot serialize a migrate-on-write
+    // because there is no scoped state to claim yet. The dedicated lock does,
+    // without writing a lease into the legacy file.
+    if (statePath !== legacyPath) {
+      let scopedExists = true;
+      try {
+        scopedExists = (await loadGoalState(statePath)) !== null;
+      } catch {
+        // Corrupt scoped file falls through to the lease, which fails closed.
+        scopedExists = true;
+      }
+      if (!scopedExists) {
+        const locked = await withClaimLock(
+          statePath,
+          slashOwner,
+          LEASE_TTL_MS,
+          clock,
+          fn,
+        );
+        if (!locked.ok) return BUSY_GOAL_MESSAGE;
+        return locked.value as string;
+      }
+    }
+    try {
+      const claim = await tryClaimLease(
+        statePath,
+        slashOwner,
+        LEASE_TTL_MS,
+        clock,
+      );
+      if (!claim.claimed) return BUSY_GOAL_MESSAGE;
+    } catch (err) {
+      // Claim writes the lease, so a throw here is a real save failure.
+      return 'Failed to save goal state: ' + (err as Error).message;
+    }
+    try {
+      return await fn();
+    } finally {
+      try {
+        await releaseLease(statePath, slashOwner, clock);
+      } catch {
+        // TTL reclaims a stale lease: release failure never blocks a report.
+      }
+    }
+  };
+  /**
+   * Reload state inside a held lease so a mutation writes the newest snapshot.
+   * @returns fresh state, or the corrupt message when the file is unreadable
+   */
+  const reload = async (): Promise<GoalState | null> => {
+    try {
+      return statePath === legacyPath
+        ? await loadGoalState(statePath)
+        : await loadGoalStateWithFallback(statePath, legacyPath);
+    } catch {
+      return null;
+    }
+  };
   if (parsed.kind === 'status') {
     if (current === null) return 'No goal set. Use /goal <objective>.';
     return 'Goal ' + current.status + ': ' + current.objective;
@@ -158,36 +271,54 @@ export async function handleGoalCommand(
     if (!isSafeGoalTitle(parsed.objective)) {
       return 'Invalid /goal usage. Objective must not be a path escape.';
     }
-    // New objective resets counters and clears any stale lease.
-    const next = setObjective(current, parsed.objective, clock, hostVersion);
-    try {
-      await saveGoalState(statePath, next);
-    } catch (err) {
-      // Save I/O errors report separately from transition errors.
-      return 'Failed to save goal state: ' + (err as Error).message;
-    }
-    return 'Goal set to active: ' + next.objective;
+    // New objective resets counters and clears any stale lease. Runs under the
+    // lease and re-reads so a concurrent transition is never overwritten.
+    return withSlashLease(async () => {
+      const fresh = await reload();
+      if (fresh === null) {
+        // No file yet (first set) is fine; unreadable is not.
+        const exists = await loadGoalState(statePath).catch(() => null);
+        if (exists !== null) {
+          return (
+            'Goal state is corrupt at ' +
+            statePath +
+            '. Back up the file then clear it.'
+          );
+        }
+      }
+      const next = setObjective(fresh, parsed.objective, clock, hostVersion);
+      try {
+        await saveGoalState(statePath, next);
+      } catch (err) {
+        // Save I/O errors report separately from transition errors.
+        return 'Failed to save goal state: ' + (err as Error).message;
+      }
+      return 'Goal set to active: ' + next.objective;
+    });
   }
   if (current === null) {
     return 'No goal set. Use /goal <objective> first.';
   }
   if (parsed.kind === 'block') {
-    let next: GoalState;
-    try {
-      next = blockGoal(current, parsed.reason, clock);
-    } catch {
-      return (
-        'Only an active goal can be blocked. Current status: ' +
-        current.status +
-        '.'
-      );
-    }
-    try {
-      await saveGoalState(statePath, next);
-    } catch (err) {
-      return 'Failed to save goal state: ' + (err as Error).message;
-    }
-    return 'Goal marked blocked: ' + parsed.reason;
+    return withSlashLease(async () => {
+      const fresh = (await reload()) ?? current;
+      let next: GoalState;
+      try {
+        next = blockGoal(fresh, parsed.reason, clock);
+      } catch {
+        return (
+          'Only an active goal can be blocked. Current status: ' +
+          fresh.status +
+          '.'
+        );
+      }
+      try {
+        await saveGoalState(statePath, next);
+      } catch (err) {
+        return 'Failed to save goal state: ' + (err as Error).message;
+      }
+      return 'Goal marked blocked: ' + parsed.reason;
+    });
   }
   if (parsed.kind === 'evidence') {
     // Parity by construction: the slash lane calls the tool handler directly,
@@ -210,9 +341,10 @@ export async function handleGoalCommand(
     // Evidence gate: active goals need proof, blocked or done still report status.
     // Why order matters: legacy status error must surface first so existing
     // blocked-complete test keeps its message. Only active goals reach verifier.
-    let next: GoalState;
+    // This is a pre-check only: the authoritative transition is recomputed from
+    // freshly reloaded state after the lease is held (see below).
     try {
-      next = completeGoal(current, clock);
+      completeGoal(current, clock);
     } catch {
       return (
         'Only an active goal can complete. Current status: ' +
@@ -221,55 +353,142 @@ export async function handleGoalCommand(
       );
     }
     // Active path now requires evidence: missing proof blocks with friendly text.
-    // Scoped evidence: a session completes only on its own citations.
-    try {
-      const ev = await loadEvidence(projectDir, storage);
-      const check = await tryCompleteWithEvidence({
-        projectDir,
-        evidence: ev,
-      });
-      if (!check.ok) {
+    // Guard first: completion now observes real commands, so a long proof pass
+    // must serialize against the loop and the tool lane. The TTL covers the whole
+    // proof budget plus a release buffer. `slashOwner` is the same owner every
+    // slash mutation uses, so no slash write can slip in during the pass.
+    const owner = slashOwner;
+    /** The completion body, run under whichever guard applies to this file. */
+    const finishComplete = async (): Promise<string> => {
+      // Scoped evidence: a session completes only on its own citations.
+      let evidenceError = false;
+      try {
+        const ev = await loadEvidence(projectDir, storage);
+        const check = await tryCompleteWithEvidence({
+          projectDir,
+          evidence: ev,
+          clock,
+        });
+        if (!check.ok) {
+          return (
+            'Complete blocked: ' +
+            check.reason +
+            '. Add file citations plus passing tests to evidence.'
+          );
+        }
+      } catch {
+        // Verifier failure fails closed: do not mark complete without proof.
+        evidenceError = true;
+      }
+      if (evidenceError) {
+        return 'Complete blocked: verifier-error. Add evidence and retry.';
+      }
+      // Reload AFTER proof, immediately before the save: a proof pass can run
+      // for minutes, so this is the only snapshot safe to write.
+      const fresh = await loadGoalStateWithFallback(statePath, legacyPath);
+      if (fresh === null) {
+        return 'No goal set. Use /goal <objective> first.';
+      }
+      // Identity check across the whole generation, not just the objective: a
+      // block, a clear, or a loop turn during the pass also invalidates this
+      // completion. Aborting writes nothing.
+      if (goalIdentity(fresh) !== goalIdentity(current)) {
+        return STATE_CHANGED_MESSAGE;
+      }
+      let next: GoalState;
+      try {
+        next = completeGoal(fresh, clock);
+      } catch {
         return (
-          'Complete blocked: ' +
-          check.reason +
-          '. Add file citations plus passing tests to evidence.'
+          'Only an active goal can complete. Current status: ' +
+          fresh.status +
+          '.'
         );
       }
-    } catch {
-      // Verifier failure fails closed: do not mark complete without proof.
-      return 'Complete blocked: verifier-error. Add evidence and retry.';
+      try {
+        await saveGoalState(statePath, next);
+      } catch (err) {
+        return 'Failed to save goal state: ' + (err as Error).message;
+      }
+      return 'Goal marked complete.';
+    };
+    // Migrate-on-write: with no scoped file yet the lease cannot be claimed, so
+    // the dedicated lock guards this first write instead of reporting busy.
+    if (statePath !== legacyPath) {
+      let scopedMissing = false;
+      try {
+        scopedMissing = (await loadGoalState(statePath)) === null;
+      } catch {
+        // Corrupt scoped file falls through to the lease, which fails closed.
+      }
+      if (scopedMissing) {
+        const locked = await withClaimLock(
+          statePath,
+          owner,
+          PROOF_TOTAL_TIMEOUT_MS + 60000,
+          clock,
+          finishComplete,
+        );
+        if (!locked.ok) return BUSY_GOAL_MESSAGE;
+        return locked.value as string;
+      }
     }
+    let held = false;
     try {
-      await saveGoalState(statePath, next);
-    } catch (err) {
-      return 'Failed to save goal state: ' + (err as Error).message;
+      const claim = await tryClaimLease(
+        statePath,
+        owner,
+        PROOF_TOTAL_TIMEOUT_MS + 60000,
+        clock,
+      );
+      held = claim.claimed;
+    } catch {
+      // Lock I/O failure fails closed: never run proof without the lease.
+      return BUSY_GOAL_MESSAGE;
     }
-    return 'Goal marked complete.';
+    if (!held) return BUSY_GOAL_MESSAGE;
+    try {
+      return await finishComplete();
+    } finally {
+      // Release is a no-op after a successful save (the transition clears it),
+      // and the safety net for every early return above.
+      try {
+        await releaseLease(statePath, owner, clock);
+      } catch {
+        // TTL reclaims a stale lease: release failure never blocks a report.
+      }
+    }
   }
   if (parsed.kind === 'resume') {
     // Resume a parked goal back to active after an explicit user request.
-    let resumed: GoalState;
+    return withSlashLease(async () => {
+      const fresh = (await reload()) ?? current;
+      let resumed: GoalState;
+      try {
+        resumed = resumeGoal(fresh, clock);
+      } catch {
+        return (
+          'Only a parked goal can resume. Current status: ' + fresh.status + '.'
+        );
+      }
+      try {
+        await saveGoalState(statePath, resumed);
+      } catch (err) {
+        return 'Failed to save goal state: ' + (err as Error).message;
+      }
+      return 'Goal resumed: ' + resumed.objective;
+    });
+  }
+  return withSlashLease(async () => {
+    const fresh = (await reload()) ?? current;
+    const cleared = clearGoal(fresh, clock);
     try {
-      resumed = resumeGoal(current, clock);
-    } catch {
-      return (
-        'Only a parked goal can resume. Current status: ' + current.status + '.'
-      );
-    }
-    try {
-      await saveGoalState(statePath, resumed);
+      await saveGoalState(statePath, cleared);
     } catch (err) {
       return 'Failed to save goal state: ' + (err as Error).message;
     }
-    return 'Goal resumed: ' + resumed.objective;
-  }
-  const cleared = clearGoal(current, clock);
-  try {
-    await saveGoalState(statePath, cleared);
-  } catch (err) {
-    return 'Failed to save goal state: ' + (err as Error).message;
-  }
-  return 'Goal cleared.';
+    return 'Goal cleared.';
+  });
 }
 
 /**

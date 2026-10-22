@@ -1,3 +1,4 @@
+// Sibling Docs: src/README.md | Decisions: src/DECISIONS.md
 /**
  * File-backed goal state for OpenCode V2 plugin Phase 1.
  * Why this module exists: memory is lost on compaction, file state survives.
@@ -175,6 +176,24 @@ export async function loadGoalStateWithFallback(
   } catch {
     throw new Error('corrupt goal state at ' + legacyPath);
   }
+}
+
+/**
+ * Stable identity for one goal generation.
+ * Why this exists: completion runs a proof pass that can last minutes, so it
+ * must refuse to write a state that was replaced or mutated in the meantime.
+ * Lease fields are excluded on purpose because claiming legitimately rewrites
+ * them; the fields kept here only change on a real transition.
+ * @param state current goal state
+ */
+export function goalIdentity(state: GoalState): string {
+  return [
+    state.objective,
+    String(state.createdAtMs),
+    state.status,
+    String(state.iterationCount),
+    String(state.recoveryEpoch),
+  ].join('|');
 }
 
 /**
@@ -580,6 +599,77 @@ async function acquireClaimLock(
       // Unreadable lock means another live run owns it: loser exits quietly.
     }
     return false;
+  }
+}
+
+/**
+ * Run a callback under the short-lived claim lock for one state path.
+ * Why this exists: the first write to a per-session file has no state to claim,
+ * so the lease alone cannot serialize a migrate-on-write. The same lock file
+ * that guards lease claims serializes that window, and it never touches the
+ * legacy state file.
+ * @param statePath absolute path whose `.lock` sibling is taken
+ * @param owner lock owner id, used only for audit in the lock payload
+ * @param ttlMs stale-lock reclaim window
+ * @param clock injected clock
+ * @param fn callback to run while the lock is held
+ * @returns ok false when another writer already holds the lock
+ */
+export async function withClaimLock<T>(
+  statePath: string,
+  owner: string,
+  ttlMs: number,
+  clock: Clock,
+  fn: () => Promise<T>,
+): Promise<{ ok: boolean; value?: T }> {
+  const acquired = await acquireScopedLock(statePath, owner, ttlMs, clock);
+  if (!acquired) return { ok: false };
+  try {
+    return { ok: true, value: await fn() };
+  } finally {
+    await releaseScopedLock(statePath);
+  }
+}
+
+/**
+ * Acquire the short-lived lock for one state path without running a callback.
+ * Why separate from withClaimLock: callers that mutate through several helpers
+ * need to hold the lock across their own body and release it in a finally.
+ * @param statePath absolute state path whose `.lock` sibling is taken
+ * @param owner lock owner id for the audit payload
+ * @param ttlMs stale-lock reclaim window
+ * @param clock injected clock
+ */
+export async function acquireScopedLock(
+  statePath: string,
+  owner: string,
+  ttlMs: number,
+  clock: Clock,
+): Promise<boolean> {
+  const lockPath = statePath + '.lock';
+  // First write: the goals dir may not exist yet, and wx-create would fail ENOENT.
+  try {
+    await fs.mkdir(path.dirname(lockPath), { recursive: true });
+  } catch {
+    return false;
+  }
+  try {
+    return await acquireClaimLock(lockPath, owner, ttlMs, clock);
+  } catch {
+    // Lock I/O failure fails closed: the caller treats it as contention.
+    return false;
+  }
+}
+
+/**
+ * Release the short-lived lock for one state path, best-effort.
+ * @param statePath absolute state path whose `.lock` sibling is removed
+ */
+export async function releaseScopedLock(statePath: string): Promise<void> {
+  try {
+    await fs.unlink(statePath + '.lock');
+  } catch {
+    // Already gone (reclaimed as stale elsewhere): safe to ignore.
   }
 }
 

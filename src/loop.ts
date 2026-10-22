@@ -1,3 +1,4 @@
+// Sibling Docs: src/README.md | Decisions: src/DECISIONS.md
 /**
  * Idle auto-continue loop Phase 2.
  * Why this module exists: decides exactly one safe continuation per idle tick.

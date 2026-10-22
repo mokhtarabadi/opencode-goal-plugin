@@ -1,3 +1,4 @@
+// Sibling Docs: src/README.md | Decisions: src/DECISIONS.md
 /**
  * Compaction snapshot plus restore Phase 3.
  * Why this module exists: memory dies on compaction, file state must resume cleanly.

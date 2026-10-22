@@ -2,6 +2,7 @@ node_modules/
 dist/
 .opencode/goal-state.json
 .opencode/goal-evidence.json
+.opencode/goals/
 STOP_GOAL
 .opencode/STOP_GOAL
 context-reports/

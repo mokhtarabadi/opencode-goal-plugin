@@ -129,6 +129,37 @@ describe('session isolation', () => {
     expect(legacy?.status).toBe('active');
   });
 
+  it('concurrent first writes on a legacy goal serialize', async () => {
+    // Migrate-on-write: the scoped file does not exist and the state comes from
+    // the legacy fallback, so the lease cannot serialize it. The dedicated lock
+    // must let exactly one writer through and leave one consistent scoped file.
+    const dir = mkdtempSync(path.join(tmpdir(), 'goal-iso-lock-'));
+    const clock = new FakeClock();
+    await handleGoalCommand('/goal legacy goal', dir, clock);
+    const [a, b] = await Promise.all([
+      handleGoalCommand(
+        '/goal block reason one',
+        dir,
+        clock,
+        '2.0.29',
+        'sess-L',
+      ),
+      handleGoalCommand(
+        '/goal block reason two',
+        dir,
+        clock,
+        '2.0.29',
+        'sess-L',
+      ),
+    ]);
+    const results = [a, b];
+    expect(
+      results.filter((r) => r.includes('Goal marked blocked')).length,
+    ).toBe(1);
+    expect(results.filter((r) => /busy/i.test(r)).length).toBe(1);
+    const scoped = await loadGoalState(resolveStatePath(dir, 'sess-L'));
+    expect(scoped?.status).toBe('blocked');
+  });
   it('sanitize blocks path traversal without throwing', async () => {
     expect(sanitizeSessionId('../../etc')).toMatch(/^sid-[0-9a-f]{8}$/);
     expect(sanitizeSessionId('sess-A')).toBe('sess-A');

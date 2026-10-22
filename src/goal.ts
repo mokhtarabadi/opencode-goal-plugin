@@ -1,3 +1,4 @@
+// Sibling Docs: src/README.md | Decisions: src/DECISIONS.md
 /**
  * Slash goal parsing and status transitions Phase 1.
  * Why this module exists: isolates user input handling from storage and host wiring.

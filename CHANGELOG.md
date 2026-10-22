@@ -31,6 +31,8 @@ All notable changes follow Keep a Changelog.
 - Hotfix setup guard plus session fairness plus lease proof with sidecar.
 - Hotfix evidence validation: slash rejects empty exit codes (Number('') coerces to 0); tool trims file entries and rejects partial bad files/tests arrays instead of silently dropping.
 - Session-scoped goal isolation: state and evidence now live per session under `.opencode/goals/<sessionId>.json` so session B never sees or continues session A's goal; legacy single file stays as read fallback with migrate-on-write.
+- Observed test proof: `goal_complete` now executes every recorded test command in the project directory under a 300s per-command and 600s per-pass budget with a 1 MiB output cap, and requires each to exit 0, so a typed `exitCode` can no longer close a goal; `verifyLocal` keeps declare-only behavior unless observation is requested.
+- Docs sync for the per-session layout across README, AGENTS, AGENT-TOOLS, conventions, commands, gitignore, and ADR-010/ADR-011.
 - Hotfix2 afterSend Clock plus Set copy plus prune helper plus drive-relative guard.
 
 ## [0.3.0] - 2026-10-16

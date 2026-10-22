@@ -1,3 +1,4 @@
+// Sibling Docs: src/README.md | Decisions: src/DECISIONS.md
 /**
  * Agent-callable goal tools.
  * Why this module exists: the model needs to drive the goal itself mid-session
@@ -14,9 +15,12 @@
 import type { Clock, GoalState } from './state.js';
 import {
   LEASE_TTL_MS,
+  acquireScopedLock,
+  goalIdentity,
   loadGoalState,
   loadGoalStateWithFallback,
   releaseLease,
+  releaseScopedLock,
   resolveLegacyStatePath,
   resolveStatePath,
   saveGoalState,
@@ -41,6 +45,7 @@ import {
   validateEvidenceShape,
 } from './evidence.js';
 import { tryCompleteWithEvidence } from './verifier.js';
+import { PROOF_TOTAL_TIMEOUT_MS } from './proof.js';
 
 /** Host version stamped on tool-created state, matching the slash lane. */
 const TOOL_HOST_VERSION = '2.0.29';
@@ -92,15 +97,39 @@ function corruptMessage(statePath: string): string {
   );
 }
 
+/** Module counter so two calls in one session never share a lease owner id. */
+let toolOwnerSeq = 0;
+
 /** Message when another turn holds the lease; no mutation happened. */
 const BUSY_MESSAGE = 'Goal is busy with another turn. Retry shortly.';
 
 /**
- * Claim the file lease for a tool mutation.
- * Why lease first: two parallel tool calls (or a tool plus the idle loop)
- * must serialize their read-modify-write. null state needs no lease — there
- * is no file to race on, matching first-set semantics.
- * @returns claimed owner id, or null when no claim was needed or possible
+ * Message when the goal identity changed during a long completion pass.
+ * Why shared text: the slash lane reports the same string, so callers see one
+ * recovery story no matter which surface started the completion.
+ */
+const STATE_CHANGED_MESSAGE =
+  'Goal state changed while completing. Run /goal status and retry.';
+
+/**
+ * Guard handed back by `claimForTool`.
+ * Why a release closure: two different guards are possible (scoped lock for a
+ * first write, file lease otherwise) and only the guard this call actually took
+ * may be released. Unlinking a shared lock path unconditionally would delete a
+ * different writer's lock.
+ */
+interface ToolClaim {
+  claimed: boolean;
+  release: () => Promise<void>;
+}
+
+/**
+ * Claim the file lease for a tool mutation, or the scoped lock on a first write.
+ * Why lease first: two parallel tool calls (or a tool plus the idle loop) must
+ * serialize their read-modify-write. A missing state file cannot be leased, so
+ * that path takes the dedicated scoped lock instead; with no file at all the
+ * first set still takes the lock so two first sets cannot interleave.
+ * @returns the claim plus the closure that releases exactly what was taken
  */
 async function claimForTool(
   statePath: string,
@@ -108,44 +137,62 @@ async function claimForTool(
   current: GoalState | null,
   owner: string,
   clock: Clock,
-): Promise<{ claimed: boolean }> {
-  if (current === null) return { claimed: true };
-  // First write to a missing scoped file needs no lease: no file to race.
-  // Why scoped check matters: fallback may have loaded legacy content while
-  // the scoped path is still absent. Claiming the absent path would fail
-  // closed (tryClaimLease returns false on null) and wrongly report busy.
+  ttlMs: number = LEASE_TTL_MS,
+): Promise<ToolClaim> {
+  const takeLock = async (): Promise<ToolClaim> => {
+    const ok = await acquireScopedLock(statePath, owner, ttlMs, clock);
+    return {
+      claimed: ok,
+      release: async () => {
+        await releaseScopedLock(statePath);
+      },
+    };
+  };
+  const noopRelease = async (): Promise<void> => {
+    // Nothing was acquired: releasing would touch another writer's guard.
+  };
+  // No state file at all: serialize the very first write with the lock.
+  if (current === null) return takeLock();
+  // Scoped file missing but legacy content may exist: lock the migration window.
   if (statePath !== legacyPath) {
+    let scopedMissing = false;
     try {
-      const scoped = await loadGoalState(statePath);
-      if (scoped === null) return { claimed: true };
+      scopedMissing = (await loadGoalState(statePath)) === null;
     } catch {
-      // Corrupt scoped fails closed below via tryClaimLease path.
+      // Corrupt scoped file falls through to the lease, which fails closed.
+      scopedMissing = false;
     }
+    if (scopedMissing) return takeLock();
   }
   try {
-    const res = await tryClaimLease(statePath, owner, LEASE_TTL_MS, clock);
-    return { claimed: res.claimed };
+    const res = await tryClaimLease(statePath, owner, ttlMs, clock);
+    if (!res.claimed) return { claimed: false, release: noopRelease };
+    return {
+      claimed: true,
+      release: async () => {
+        try {
+          await releaseLease(statePath, owner, clock);
+        } catch {
+          // Release failure is safe: the TTL reclaims a stale lease.
+        }
+      },
+    };
   } catch {
-    // Lock I/O failure fails closed: never mutate without the lease.
-    return { claimed: false };
+    // Lock I/O failure fails closed: never mutate without a guard.
+    return { claimed: false, release: noopRelease };
   }
 }
 
 /**
- * Release a tool-held lease, best-effort.
- * Why best-effort: transition helpers already clear the lease on save, so
- * this is normally a no-op; it only matters when a save threw mid-mutation.
+ * Unique lease owner for one tool invocation.
+ * Why not the bare session id: the lease treats a repeated owner as the same
+ * writer and lets it re-claim, so two concurrent calls in one session could both
+ * enter a read-modify-write. A per-call suffix makes them distinct.
+ * @param sessionID lane id from the host tool context
  */
-async function releaseToolLease(
-  statePath: string,
-  owner: string,
-  clock: Clock,
-): Promise<void> {
-  try {
-    await releaseLease(statePath, owner, clock);
-  } catch {
-    // Release failure is safe: the TTL reclaims a stale lease.
-  }
+function toolOwner(sessionID: string): string {
+  toolOwnerSeq += 1;
+  return 'tool:' + sessionID + ':' + String(toolOwnerSeq);
 }
 
 /**
@@ -208,7 +255,7 @@ async function toolSet(
   const legacyPath = resolveLegacyStatePath(projectDir);
   const loaded = await loadForTool(statePath, legacyPath);
   if ('error' in loaded) return loaded.error;
-  const owner = 'tool:' + sessionID;
+  const owner = toolOwner(sessionID);
   const claim = await claimForTool(
     statePath,
     legacyPath,
@@ -226,7 +273,7 @@ async function toolSet(
     }
     return 'Goal set to active: ' + next.objective;
   } finally {
-    await releaseToolLease(statePath, owner, clock);
+    await claim.release();
   }
 }
 
@@ -254,7 +301,7 @@ async function toolBlock(
   if (loaded.state === null) {
     return 'No goal set. Use /goal <objective> first.';
   }
-  const owner = 'tool:' + sessionID;
+  const owner = toolOwner(sessionID);
   const claim = await claimForTool(
     statePath,
     legacyPath,
@@ -264,13 +311,20 @@ async function toolBlock(
   );
   if (!claim.claimed) return BUSY_MESSAGE;
   try {
+    // Reload inside the guard: the pre-claim snapshot may be stale, and acting
+    // on it would overwrite a change made between load and claim.
+    const fresh = await loadForTool(statePath, legacyPath);
+    if ('error' in fresh) return fresh.error;
+    if (fresh.state === null) {
+      return 'No goal set. Use /goal <objective> first.';
+    }
     let next: GoalState;
     try {
-      next = blockGoal(loaded.state, reason, clock);
+      next = blockGoal(fresh.state, reason, clock);
     } catch {
       return (
         'Only an active goal can be blocked. Current status: ' +
-        loaded.state.status +
+        fresh.state.status +
         '.'
       );
     }
@@ -281,7 +335,7 @@ async function toolBlock(
     }
     return 'Goal marked blocked: ' + reason;
   } finally {
-    await releaseToolLease(statePath, owner, clock);
+    await claim.release();
   }
 }
 
@@ -391,7 +445,7 @@ export async function recordEvidence(
       '.'
     );
   }
-  const owner = 'tool:' + sessionID;
+  const owner = toolOwner(sessionID);
   const claimRes = await claimForTool(
     statePath,
     legacyPath,
@@ -401,6 +455,20 @@ export async function recordEvidence(
   );
   if (!claimRes.claimed) return BUSY_MESSAGE;
   try {
+    // Reload inside the guard: evidence may only be recorded for a goal that is
+    // still active now, not for the one seen before the claim.
+    const fresh = await loadForTool(statePath, legacyPath);
+    if ('error' in fresh) return fresh.error;
+    if (fresh.state === null) {
+      return 'No goal set. Use /goal <objective> first.';
+    }
+    if (fresh.state.status !== 'active') {
+      return (
+        'Only an active goal can record evidence. Current status: ' +
+        fresh.state.status +
+        '.'
+      );
+    }
     // Null sidecar (e.g. tool-lane set never seeded one) starts empty.
     // Scoped evidence: slash plus tool lanes never share citations.
     const current =
@@ -436,7 +504,7 @@ export async function recordEvidence(
     }
     return 'Criterion recorded for ' + id + '.';
   } finally {
-    await releaseToolLease(statePath, owner, clock);
+    await claimRes.release();
   }
 }
 
@@ -459,31 +527,25 @@ async function toolComplete(
   if (loaded.state === null) {
     return 'No goal set. Use /goal <objective> first.';
   }
-  const owner = 'tool:' + sessionID;
+  const owner = toolOwner(sessionID);
+  // Longer lease: completion now observes real test commands, so the guard
+  // must outlive the verification pass instead of expiring mid-run.
   const claim = await claimForTool(
     statePath,
     legacyPath,
     loaded.state,
     owner,
     clock,
+    PROOF_TOTAL_TIMEOUT_MS + 60000,
   );
   if (!claim.claimed) return BUSY_MESSAGE;
   try {
-    let next: GoalState;
-    try {
-      next = completeGoal(loaded.state, clock);
-    } catch {
-      return (
-        'Only an active goal can complete. Current status: ' +
-        loaded.state.status +
-        '.'
-      );
-    }
     try {
       const ev = await loadEvidence(projectDir, storage);
       const check = await tryCompleteWithEvidence({
         projectDir,
         evidence: ev,
+        clock,
       });
       if (!check.ok) {
         return (
@@ -495,6 +557,29 @@ async function toolComplete(
     } catch {
       return 'Complete blocked: verifier-error. Add evidence and retry.';
     }
+    // Reload AFTER proof, immediately before the save: the only snapshot that
+    // is safe to write after a pass that can run for minutes. Same guard and
+    // message as the slash lane, so both surfaces recover identically.
+    const fresh = await loadForTool(statePath, legacyPath);
+    if ('error' in fresh) return fresh.error;
+    if (fresh.state === null) {
+      return 'No goal set. Use /goal <objective> first.';
+    }
+    // Whole-generation identity, not just the objective: any transition during
+    // the pass invalidates this completion and must not be overwritten.
+    if (goalIdentity(fresh.state) !== goalIdentity(loaded.state)) {
+      return STATE_CHANGED_MESSAGE;
+    }
+    let next: GoalState;
+    try {
+      next = completeGoal(fresh.state, clock);
+    } catch {
+      return (
+        'Only an active goal can complete. Current status: ' +
+        fresh.state.status +
+        '.'
+      );
+    }
     try {
       await saveGoalState(statePath, next);
     } catch (err) {
@@ -502,7 +587,7 @@ async function toolComplete(
     }
     return 'Goal marked complete.';
   } finally {
-    await releaseToolLease(statePath, owner, clock);
+    await claim.release();
   }
 }
 
@@ -522,7 +607,7 @@ async function toolResume(
   if (loaded.state === null) {
     return 'No goal set. Use /goal <objective> first.';
   }
-  const owner = 'tool:' + sessionID;
+  const owner = toolOwner(sessionID);
   const claim = await claimForTool(
     statePath,
     legacyPath,
@@ -532,13 +617,20 @@ async function toolResume(
   );
   if (!claim.claimed) return BUSY_MESSAGE;
   try {
+    // Reload inside the guard: resuming the snapshot read before the claim
+    // would resurrect state that a concurrent transition already changed.
+    const fresh = await loadForTool(statePath, legacyPath);
+    if ('error' in fresh) return fresh.error;
+    if (fresh.state === null) {
+      return 'No goal set. Use /goal <objective> first.';
+    }
     let resumed: GoalState;
     try {
-      resumed = resumeGoal(loaded.state, clock);
+      resumed = resumeGoal(fresh.state, clock);
     } catch {
       return (
         'Only a parked goal can resume. Current status: ' +
-        loaded.state.status +
+        fresh.state.status +
         '.'
       );
     }
@@ -549,7 +641,7 @@ async function toolResume(
     }
     return 'Goal resumed: ' + resumed.objective;
   } finally {
-    await releaseToolLease(statePath, owner, clock);
+    await claim.release();
   }
 }
 

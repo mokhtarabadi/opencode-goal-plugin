@@ -1,3 +1,4 @@
+// Sibling Docs: src/README.md | Decisions: src/DECISIONS.md
 /**
  * Completion evidence sidecar Phase 3.
  * Why this module exists: completion needs cited proof, never self-report alone.

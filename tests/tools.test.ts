@@ -229,6 +229,32 @@ describe('tool execute parity with slash', () => {
     const stateB = await loadGoalState(resolveStatePath(dirB));
     expect(stateB).toBeNull();
   });
+  it('a same-session tool call never re-enters an in-flight lease', async () => {
+    // Owner ids are per call, not per session: the lease lets a repeated owner
+    // re-claim, so a fixed `tool:<session>` owner would admit a second writer.
+    const { tryClaimLease, resolveStatePath, LEASE_TTL_MS } =
+      await import('../src/state.js');
+    const clock = new FakeClock();
+    const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-sameowner-'));
+    const defs = await toolDefs(dir);
+    await byName(defs, 'goal_set').execute(
+      { title: 'baseline' },
+      { sessionID: 'sess-R' },
+    );
+    // Simulate an in-flight call from the same session holding the lease.
+    const held = await tryClaimLease(
+      resolveStatePath(dir, 'sess-R'),
+      'tool:sess-R',
+      LEASE_TTL_MS,
+      clock,
+    );
+    expect(held.claimed).toBe(true);
+    const blocked = await byName(defs, 'goal_block').execute(
+      { reason: 'second writer' },
+      { sessionID: 'sess-R' },
+    );
+    expect(blocked.content).toMatch(/busy/i);
+  });
   it('held lease blocks tool mutate without changing state', async () => {
     // Simulate the loop holding the lease: tool must back off, not clobber.
     const { readFileSync } = await import('node:fs');
@@ -346,7 +372,8 @@ describe('goal_evidence sole writer', () => {
         id: 'e1',
         claim: 'work is done',
         files: ['proof.txt'],
-        tests: [{ command: 'npm test', exitCode: 0 }],
+        // Real zero exit: goal_complete now runs the command and reads its code.
+        tests: [{ command: 'node -e "process.exit(0)"', exitCode: 0 }],
       },
       { sessionID: 'sess-ev' },
     );
@@ -471,7 +498,7 @@ describe('hotfix qa-reject negative paths', () => {
     id: 'e1',
     claim: 'holds',
     files: ['src/a.ts'],
-    tests: [{ command: 'npm test', exitCode: 0 }],
+    tests: [{ command: 'node -e "process.exit(0)"', exitCode: 0 }],
   };
   it('slash with empty exit code is invalid and writes nothing', async () => {
     const { existsSync } = await import('node:fs');
