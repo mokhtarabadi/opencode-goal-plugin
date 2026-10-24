@@ -737,4 +737,40 @@ describe('goal_set clears stale evidence', () => {
     expect(readCriteria(dirTool, 'sess-parT')).toEqual([]);
     expect(readCriteria(dirSlash, 'sess-parS')).toEqual([]);
   });
+  it('legacy sidecar cannot re-inject stale criteria after a set', async () => {
+    const { writeFileSync } = await import('node:fs');
+    const { saveEvidence } = await import('../src/evidence.js');
+    const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-legacy-'));
+    writeFileSync(path.join(dir, 'proof.txt'), 'done\n');
+    // Pre-isolation sidecar from an older version: one failing criterion.
+    await saveEvidence(dir, {
+      version: 1,
+      updatedAtMs: 1700000000000,
+      criteria: [
+        {
+          id: 'ancient',
+          claim: 'finished goal proof',
+          files: ['proof.txt'],
+          tests: [{ command: 'node -e "process.exit(1)"', exitCode: 1 }],
+        },
+      ],
+    });
+    const defs = await toolDefs(dir);
+    const session = { sessionID: 'sess-legacy' };
+    await byName(defs, 'goal_set').execute({ title: 'fresh goal' }, session);
+    await byName(defs, 'goal_evidence').execute(
+      {
+        id: 'fresh',
+        claim: 'fresh proof',
+        files: ['proof.txt'],
+        tests: [{ command: 'node -e "process.exit(0)"', exitCode: 0 }],
+      },
+      session,
+    );
+    // Only the new criterion lands; the legacy list is not merged back in.
+    expect(readCriteria(dir, 'sess-legacy')).toHaveLength(1);
+    expect(readCriteria(dir, 'sess-legacy')[0]).toMatchObject({ id: 'fresh' });
+    const done = await byName(defs, 'goal_complete').execute({}, session);
+    expect(done.content).toBe('Goal marked complete.');
+  });
 });

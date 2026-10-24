@@ -28,7 +28,9 @@ module is pure enough to test without an OpenCode host.
 2. State and evidence are per session at `.opencode/goals/<session-id>.json` and
    `.evidence.json`, sanitized to `[A-Za-z0-9_-]{1,64}` or a `sid-<fnv1a>` hash.
    The legacy `.opencode/goal-state.json` and `.opencode/goal-evidence.json` are
-   read fallbacks only; the next scoped write migrates a user forward.
+   read fallbacks only, and only until the session owns its own file: once the
+   scoped path exists it is authoritative, empty or invalid included, so a seeded
+   empty sidecar cannot pull stale criteria back from the legacy bucket.
 3. Every mutation runs under the claim lock and lease. Completion claims a TTL
    that covers the whole proof budget.
 4. Completion reloads the state after proof and refuses to write when the
@@ -41,7 +43,10 @@ module is pure enough to test without an OpenCode host.
 7. Both set lanes (slash `/goal <objective>` and the `goal_set` tool) reset the
    session evidence sidecar. Criteria never outlive the goal they were recorded
    for, so a finished goal's failing command cannot gate the next one.
-8. Nothing in `src/` throws into the host: host callbacks map failures to a
+8. The legacy evidence sidecar is a read fallback only until the session has its
+   own file. Presence, not a successful parse, ends the fallback: an empty seed
+   must stay empty instead of merging the old bucket back in.
+9. Nothing in `src/` throws into the host: host callbacks map failures to a
    reason string.
 
 ## Risks

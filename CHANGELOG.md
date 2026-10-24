@@ -35,6 +35,7 @@ All notable changes follow Keep a Changelog.
 - Docs sync for the per-session layout across README, AGENTS, AGENT-TOOLS, conventions, commands, gitignore, and ADR-010/ADR-011.
 - Hotfix2 afterSend Clock plus Set copy plus prune helper plus drive-relative guard.
 - Tool-lane `goal_set` now seeds a fresh evidence sidecar like `/goal <objective>`, so criteria recorded for a finished goal no longer accumulate and block later completions with `evidence-invalid`; regression tests cover the stale-criteria path, the old failing command, and slash/tool parity.
+- Evidence reads stop falling back to the pre-isolation sidecar once the session has its own file, because an empty seeded file used to parse as absent and merge the legacy bucket back in; a session with no scoped file still migrates once.
 
 ## [0.3.0] - 2026-10-16
 

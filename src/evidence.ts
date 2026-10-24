@@ -120,8 +120,27 @@ export function hashEvidence(ev: GoalEvidenceFile): string {
 }
 
 /**
+ * True when a path exists on disk, used to tell an absent scoped file from a
+ * present-but-empty one. Any error other than success counts as absent, which
+ * keeps a permission failure on the legacy path rather than a hard throw.
+ * @param p absolute path
+ */
+async function existsAt(p: string): Promise<boolean> {
+  try {
+    await fs.access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Load evidence sidecar, returning null when absent or invalid.
  * Scoped first with legacy fallback so old sidecars migrate on next write.
+ * A scoped file that exists is authoritative even when it is empty or invalid:
+ * both set lanes seed an empty file to discard criteria from finished goals,
+ * and that file fails shape validation by design, so falling back on null would
+ * resurrect exactly the criteria the set removed.
  * @param projectDir absolute project root
  * @param sessionId optional session lane id; empty or missing means legacy
  */
@@ -147,8 +166,9 @@ export async function loadEvidence(
     }
   };
   if (scoped === legacy || t.length === 0) return readOne(legacy);
-  const hit = await readOne(scoped);
-  if (hit !== null) return hit;
+  // Presence decides, not the parse result: a session that has its own file has
+  // migrated and never reads the shared legacy bucket again.
+  if (await existsAt(scoped)) return readOne(scoped);
   return readOne(legacy);
 }
 
