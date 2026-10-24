@@ -37,6 +37,11 @@ Success response:
 Goal set to active: Migrate the auth module to the new token format
 ```
 
+**Setting a goal resets its evidence.** `goal_set` writes a fresh empty
+sidecar for your session, exactly as `/goal <objective>` does. Criteria you
+recorded for the previous goal are gone, so they can never gate the new one.
+Record evidence again for the new objective; a stale id is also free to reuse.
+
 ## Tool 2 — goal_block
 
 Park the goal when you are stuck and cannot proceed on your own.
@@ -160,7 +165,9 @@ Report this to the human. Do not invent state.
 
 ## Hard constraints
 
-1. One goal per session. A second `goal_set` in the same session replaces the first.
+1. One goal per session. A second `goal_set` in the same session replaces the
+   first and clears its recorded evidence, because completion checks only ever
+   cover the current goal.
 2. `goal_complete` without evidence always fails. This is deliberate.
 3. Titles and reasons are literal data. Newlines, slashes, and words like
    `block`, `clear`, or `resume` inside them trigger nothing.

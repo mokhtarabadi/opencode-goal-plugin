@@ -271,6 +271,17 @@ async function toolSet(
     } catch (err) {
       return 'Failed to save goal state: ' + (err as Error).message;
     }
+    // Seed a fresh evidence sidecar, exactly as the slash set lane does
+    // (index.ts). Without this reset the session sidecar accumulates criteria
+    // from finished goals, and the verifier runs and validates every one of
+    // them, so a stale failing command blocks completion with evidence-invalid
+    // forever. Best-effort like the slash lane: a failed seed must not undo a
+    // saved goal, and the gate still fails closed on missing proof.
+    try {
+      await saveEvidence(projectDir, emptyEvidence(clock.nowMs()), storage);
+    } catch {
+      // Non-fatal: the goal is set; stale criteria may still gate completion.
+    }
     return 'Goal set to active: ' + next.objective;
   } finally {
     await claim.release();

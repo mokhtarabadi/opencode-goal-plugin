@@ -34,6 +34,7 @@ All notable changes follow Keep a Changelog.
 - Observed test proof: `goal_complete` now executes every recorded test command in the project directory under a 300s per-command and 600s per-pass budget with a 1 MiB output cap, and requires each to exit 0, so a typed `exitCode` can no longer close a goal; `verifyLocal` keeps declare-only behavior unless observation is requested.
 - Docs sync for the per-session layout across README, AGENTS, AGENT-TOOLS, conventions, commands, gitignore, and ADR-010/ADR-011.
 - Hotfix2 afterSend Clock plus Set copy plus prune helper plus drive-relative guard.
+- Tool-lane `goal_set` now seeds a fresh evidence sidecar like `/goal <objective>`, so criteria recorded for a finished goal no longer accumulate and block later completions with `evidence-invalid`; regression tests cover the stale-criteria path, the old failing command, and slash/tool parity.
 
 ## [0.3.0] - 2026-10-16
 

@@ -38,7 +38,10 @@ module is pure enough to test without an OpenCode host.
    `state.ts` is the only `Date.now()` call site.
 6. `verifyLocal` stays declare-only unless `runTests` is requested; the two
    complete lanes opt in, so observation cannot silently change old callers.
-7. Nothing in `src/` throws into the host: host callbacks map failures to a
+7. Both set lanes (slash `/goal <objective>` and the `goal_set` tool) reset the
+   session evidence sidecar. Criteria never outlive the goal they were recorded
+   for, so a finished goal's failing command cannot gate the next one.
+8. Nothing in `src/` throws into the host: host callbacks map failures to a
    reason string.
 
 ## Risks

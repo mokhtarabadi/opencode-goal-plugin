@@ -4,10 +4,11 @@
  * the exact slash handler, so model-driven and user-driven paths cannot drift.
  */
 import { describe, expect, it } from 'vitest';
-import { mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { registerGoalTools } from '../src/tools.js';
+import { resolveEvidencePath } from '../src/evidence.js';
 import {
   BlockInputSchema,
   CompleteInputSchema,
@@ -43,6 +44,21 @@ function fakeCtx(defs: CapturedDef[]): unknown {
       },
     },
   };
+}
+
+/**
+ * Criteria currently on disk for one lane.
+ * Why a raw read instead of loadEvidence: a freshly seeded sidecar holds an
+ * empty list, which shape validation rejects as `evidence-empty`, so
+ * loadEvidence maps it to null and cannot report the file at all.
+ */
+function readCriteria(dir: string, sessionId?: string): unknown[] {
+  const file = resolveEvidencePath(dir, sessionId);
+  if (!existsSync(file)) return [];
+  const parsed = JSON.parse(readFileSync(file, 'utf8')) as {
+    criteria?: unknown[];
+  };
+  return parsed.criteria ?? [];
 }
 
 describe('registerGoalTools', () => {
@@ -387,8 +403,6 @@ describe('goal_evidence sole writer', () => {
     expect(done.content).toBe('Goal marked complete.');
   });
   it('hostile shape writes nothing', async () => {
-    const { existsSync } = await import('node:fs');
-    const { resolveEvidencePath } = await import('../src/evidence.js');
     const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-evbad-'));
     const defs = await toolDefs(dir);
     await byName(defs, 'goal_set').execute({ title: 'baseline' }, {});
@@ -397,7 +411,9 @@ describe('goal_evidence sole writer', () => {
       {},
     );
     expect(bad.content).toContain('Invalid');
-    expect(existsSync(resolveEvidencePath(dir))).toBe(false);
+    // goal_set seeds an empty sidecar, so "nothing written" means no criterion
+    // landed, not that the file is absent.
+    expect(readCriteria(dir)).toEqual([]);
   });
   it('duplicate id is rejected with no second write', async () => {
     const { loadEvidence } = await import('../src/evidence.js');
@@ -446,11 +462,9 @@ describe('goal_evidence sole writer', () => {
       { sessionID: 'sess-race' },
     );
     expect(out.content).toMatch(/busy|lease|Busy/i);
-    expect(existsSync(resolveEvidencePath(dir, 'sess-race'))).toBe(false);
+    expect(readCriteria(dir, 'sess-race')).toEqual([]);
   });
   it('blocked goal rejects evidence with no write', async () => {
-    const { existsSync } = await import('node:fs');
-    const { resolveEvidencePath } = await import('../src/evidence.js');
     const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-evblk-'));
     const defs = await toolDefs(dir);
     await byName(defs, 'goal_set').execute({ title: 'stuck' }, {});
@@ -465,7 +479,7 @@ describe('goal_evidence sole writer', () => {
       {},
     );
     expect(out.content).toContain('Only an active goal');
-    expect(existsSync(resolveEvidencePath(dir))).toBe(false);
+    expect(readCriteria(dir)).toEqual([]);
   });
   it('no goal set reports status with no lease held', async () => {
     const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-evnone-'));
@@ -542,8 +556,6 @@ describe('hotfix qa-reject negative paths', () => {
     expect(existsSync(resolveEvidencePath(dir))).toBe(false);
   });
   it('tool rejects empty files or empty tests arrays with no write', async () => {
-    const { existsSync } = await import('node:fs');
-    const { resolveEvidencePath } = await import('../src/evidence.js');
     const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-qe3-'));
     const defs = await toolDefs(dir);
     await byName(defs, 'goal_set').execute({ title: 'base' }, {});
@@ -557,7 +569,7 @@ describe('hotfix qa-reject negative paths', () => {
       {},
     );
     expect(noTests.content).toContain('Invalid');
-    expect(existsSync(resolveEvidencePath(dir))).toBe(false);
+    expect(readCriteria(dir)).toEqual([]);
   });
   it('tool rejects partial bad entries instead of silently dropping', async () => {
     const { loadEvidence } = await import('../src/evidence.js');
@@ -625,5 +637,104 @@ describe('hotfix qa-reject negative paths', () => {
     );
     expect(late.content).toContain('Only an active goal');
     expect((await loadEvidence(dir))?.criteria.length).toBe(1);
+  });
+});
+
+describe('goal_set clears stale evidence', () => {
+  async function toolDefs(dir: string): Promise<CapturedDef[]> {
+    const defs: CapturedDef[] = [];
+    await registerGoalTools(fakeCtx(defs), dir, new FakeClock());
+    return defs;
+  }
+  function byName(defs: CapturedDef[], name: string): CapturedDef {
+    const found = defs.find((d) => d.name === name);
+    if (!found) throw new Error('missing tool ' + name);
+    return found;
+  }
+  it('drops criteria recorded for the previous goal', async () => {
+    const { writeFileSync } = await import('node:fs');
+    const { loadEvidence } = await import('../src/evidence.js');
+    const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-reset-'));
+    writeFileSync(path.join(dir, 'proof.txt'), 'done\n');
+    const defs = await toolDefs(dir);
+    const session = { sessionID: 'sess-reset' };
+    await byName(defs, 'goal_set').execute({ title: 'first' }, session);
+    await byName(defs, 'goal_evidence').execute(
+      {
+        id: 'stale',
+        claim: 'first goal proof',
+        files: ['proof.txt'],
+        // A recorded failure: this is the criterion that used to poison the
+        // session sidecar and block every later completion.
+        tests: [{ command: 'node -e "process.exit(1)"', exitCode: 0 }],
+      },
+      session,
+    );
+    expect((await loadEvidence(dir, 'sess-reset'))?.criteria.length).toBe(1);
+
+    await byName(defs, 'goal_set').execute({ title: 'second' }, session);
+
+    const after = readCriteria(dir, 'sess-reset');
+    expect(after).toEqual([]);
+    // The stale id is free again, so a corrected criterion can be recorded.
+    const rec = await byName(defs, 'goal_evidence').execute(
+      {
+        id: 'stale',
+        claim: 'second goal proof',
+        files: ['proof.txt'],
+        tests: [{ command: 'node -e "process.exit(0)"', exitCode: 0 }],
+      },
+      session,
+    );
+    expect(rec.content).toContain('Criterion recorded for stale');
+  });
+  it('completes a new goal even when the old goal recorded a failing command', async () => {
+    const { writeFileSync } = await import('node:fs');
+    const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-reset2-'));
+    writeFileSync(path.join(dir, 'proof.txt'), 'done\n');
+    const defs = await toolDefs(dir);
+    const session = { sessionID: 'sess-reset2' };
+    await byName(defs, 'goal_set').execute({ title: 'old goal' }, session);
+    await byName(defs, 'goal_evidence').execute(
+      {
+        id: 'old',
+        claim: 'old proof',
+        files: ['proof.txt'],
+        tests: [{ command: 'node -e "process.exit(1)"', exitCode: 0 }],
+      },
+      session,
+    );
+    await byName(defs, 'goal_set').execute({ title: 'new goal' }, session);
+    await byName(defs, 'goal_evidence').execute(
+      {
+        id: 'new',
+        claim: 'new proof',
+        files: ['proof.txt'],
+        tests: [{ command: 'node -e "process.exit(0)"', exitCode: 0 }],
+      },
+      session,
+    );
+    const done = await byName(defs, 'goal_complete').execute({}, session);
+    expect(done.content).toBe('Goal marked complete.');
+  });
+  it('slash set and tool set leave the same evidence state', async () => {
+    const { handleGoalCommand } = await import('../src/index.js');
+    const clock = new FakeClock();
+    const dirTool = mkdtempSync(path.join(tmpdir(), 'goal-tools-resetT-'));
+    const dirSlash = mkdtempSync(path.join(tmpdir(), 'goal-tools-resetS-'));
+    const defs = await toolDefs(dirTool);
+    await byName(defs, 'goal_set').execute(
+      { title: 'parity-reset' },
+      { sessionID: 'sess-parT' },
+    );
+    await handleGoalCommand(
+      '/goal parity-reset',
+      dirSlash,
+      clock,
+      '2.0.29',
+      'sess-parS',
+    );
+    expect(readCriteria(dirTool, 'sess-parT')).toEqual([]);
+    expect(readCriteria(dirSlash, 'sess-parS')).toEqual([]);
   });
 });

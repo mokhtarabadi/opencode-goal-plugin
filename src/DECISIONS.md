@@ -19,6 +19,7 @@ reader inside `src/` finds the reasoning without leaving the folder.
 | ADR-009 sole evidence writer                   | `tools.ts`, `evidence.ts`                                    |
 | ADR-010 per-session state with legacy fallback | `state.ts`, `evidence.ts`, `index.ts`, `tools.ts`, `loop.ts` |
 | ADR-011 completion observes test results       | `proof.ts`, `verifier.ts`, `tools.ts`, `index.ts`            |
+| ADR-012 set resets the evidence sidecar        | `tools.ts`, `index.ts`, `evidence.ts`                        |
 
 ## Local notes
 
