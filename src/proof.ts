@@ -101,12 +101,14 @@ function unrunable(
  * @param command recorded command string; non-strings are rejected without spawning
  * @param clock injected clock used only for duration measurement
  * @param timeoutMs per-command budget, defaults to PROOF_TIMEOUT_MS
+ * @param extraEnv optional per-test environment overrides, applied last
  */
 export async function runProofCommand(
   projectDir: string,
   command: unknown,
   clock: Clock,
   timeoutMs: number = PROOF_TIMEOUT_MS,
+  extraEnv?: Record<string, string>,
 ): Promise<ProofResult> {
   const started = clock.nowMs();
   // Trim and type-check before spawning: an empty command would be a silent no-op.
@@ -147,6 +149,9 @@ export async function runProofCommand(
             NO_COLOR: '1',
             GIT_TERMINAL_PROMPT: '0',
             PIP_NO_INPUT: '1',
+            // Per-test overrides last: the recorded command knows which toolchain
+            // it needs (a JDK, a wrapper path) better than the host process does.
+            ...(extraEnv ?? {}),
           },
         },
         (err, stdout, stderr) => {

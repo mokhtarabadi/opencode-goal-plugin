@@ -46,7 +46,10 @@ import {
   pruneIdleControllers,
 } from './compaction.js';
 import { saveEvidence, emptyEvidence, loadEvidence } from './evidence.js';
-import { tryCompleteWithEvidence } from './verifier.js';
+import {
+  describeVerificationFailure,
+  tryCompleteWithEvidence,
+} from './verifier.js';
 import { PROOF_TOTAL_TIMEOUT_MS } from './proof.js';
 import { recordEvidence, registerGoalTools } from './tools.js';
 import {
@@ -370,18 +373,14 @@ export async function handleGoalCommand(
           clock,
         });
         if (!check.ok) {
-          return (
-            'Complete blocked: ' +
-            check.reason +
-            '. Add file citations plus passing tests to evidence.'
-          );
+          return describeVerificationFailure(check.reason, check.failures);
         }
       } catch {
         // Verifier failure fails closed: do not mark complete without proof.
         evidenceError = true;
       }
       if (evidenceError) {
-        return 'Complete blocked: verifier-error. Add evidence and retry.';
+        return describeVerificationFailure('verifier-error', []);
       }
       // Reload AFTER proof, immediately before the save: a proof pass can run
       // for minutes, so this is the only snapshot safe to write.

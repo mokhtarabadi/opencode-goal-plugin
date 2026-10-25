@@ -6,6 +6,8 @@ All notable changes follow Keep a Changelog.
 
 ### Added
 
+- A blocked `goal_complete` now names what failed: `describeVerificationFailure` quotes the verifier's concrete reasons (`test-failed:<id>:exit=N`, `missing-file:<id>:<path>`, `test-budget:<id>`) for both the tool and slash lanes, capped at five with `(+N more)`, instead of one canned sentence that told the agent to add citations even when the citations were fine. Reproduced live on a JDK-mismatch proof run. Evidence tests may now carry an optional flat `env` string map, validated as strings and merged into the child environment last, so a project can pin the toolchain its command actually needs. 9 new tests (including a no-leak-across-criteria check); full suite 187 green.
+
 - Evidence traversal guard rejecting dot-dot escapes.
 - Subagent dispatch tests for pass, fail, and throw paths.
 - MIT LICENSE plus install docs for all four surfaces.

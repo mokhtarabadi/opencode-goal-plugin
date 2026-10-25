@@ -44,7 +44,10 @@ import {
   saveEvidence,
   validateEvidenceShape,
 } from './evidence.js';
-import { tryCompleteWithEvidence } from './verifier.js';
+import {
+  describeVerificationFailure,
+  tryCompleteWithEvidence,
+} from './verifier.js';
 import { PROOF_TOTAL_TIMEOUT_MS } from './proof.js';
 
 /** Host version stamped on tool-created state, matching the slash lane. */
@@ -559,14 +562,12 @@ async function toolComplete(
         clock,
       });
       if (!check.ok) {
-        return (
-          'Complete blocked: ' +
-          check.reason +
-          '. Add file citations plus passing tests to evidence.'
-        );
+        return describeVerificationFailure(check.reason, check.failures);
       }
     } catch {
-      return 'Complete blocked: verifier-error. Add evidence and retry.';
+      // Same builder as the blocked path, so a verifier throw reads like any
+      // other refusal instead of its own special-case phrasing.
+      return describeVerificationFailure('verifier-error', []);
     }
     // Reload AFTER proof, immediately before the save: the only snapshot that
     // is safe to write after a pass that can run for minutes. Same guard and

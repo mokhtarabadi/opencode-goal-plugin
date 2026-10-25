@@ -22,6 +22,15 @@ export interface EvidenceTestProof {
   command: string;
   exitCode: number;
   output?: string;
+  /**
+   * Optional environment overrides for this command.
+   * Why it exists: a project may need a specific toolchain (a JDK, an SDK path)
+   * that the host process does not carry, and a proof command that fails only
+   * because of the environment looks exactly like a real failure. Keys are
+   * merged over the process environment, so the agent can pin what the command
+   * actually needs instead of wrapping it in a shell prefix.
+   */
+  env?: Record<string, string>;
 }
 
 /** One completion criterion with file citations plus test proof. */
@@ -106,6 +115,20 @@ export function validateEvidenceShape(ev: unknown): {
       return { ok: false, reason: 'criterion-missing-files' };
     if (!Array.isArray(c['tests']) || (c['tests'] as unknown[]).length === 0)
       return { ok: false, reason: 'criterion-missing-tests' };
+    // Optional env: when present it must be a flat string map, because a nested
+    // value would be stringified by the shell and silently change the command.
+    for (const t of c['tests'] as unknown[]) {
+      if (t === null || typeof t !== 'object' || Array.isArray(t))
+        return { ok: false, reason: 'test-not-object' };
+      const env = (t as Record<string, unknown>)['env'];
+      if (env === undefined) continue;
+      if (env === null || typeof env !== 'object' || Array.isArray(env))
+        return { ok: false, reason: 'test-env-not-object' };
+      for (const value of Object.values(env as Record<string, unknown>)) {
+        if (typeof value !== 'string')
+          return { ok: false, reason: 'test-env-not-string' };
+      }
+    }
   }
   return { ok: true, reason: 'ok' };
 }

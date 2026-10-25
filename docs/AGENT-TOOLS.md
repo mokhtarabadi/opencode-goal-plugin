@@ -128,6 +128,26 @@ appends one criterion; call it once per criterion you can prove.
 }
 ```
 
+A test entry may also carry an optional `env` map of string values. It is
+merged over the host environment for that command only, which is how a project
+pins a toolchain it needs (a specific JDK, an SDK path) instead of wrapping the
+command in a shell prefix:
+
+```json
+{
+  "id": "jvm-tests",
+  "claim": "The JVM suite passes under JDK 21",
+  "files": ["src/main/java/com/apex/engine/PayoutCliService.java"],
+  "tests": [
+    {
+      "command": "mvn -B test -Dtest=PayoutCliServiceTest",
+      "exitCode": 0,
+      "env": { "JAVA_HOME": "/opt/jdk-21" }
+    }
+  ]
+}
+```
+
 Rules: `id` plus `claim` are required (non-empty, id max 200 chars,
 claim max 2000), plus at least one `files` entry and one `tests` entry —
 the stored sidecar always passes shape validation, so empties are rejected
@@ -178,3 +198,8 @@ Report this to the human. Do not invent state.
    evidence gate stay in force.
 6. `goal_evidence` stores the command you send, but `goal_complete` executes
    it and reads the real exit code. A declared `exitCode` is not proof.
+7. A blocked `goal_complete` names what failed. The reply quotes the verifier's
+   concrete reasons — `test-failed:<id>:exit=N`, `missing-file:<id>:<path>`,
+   `test-budget:<id>` — up to five of them, so you can fix the actual cause
+   instead of guessing. When a command fails only because of its environment,
+   give it that environment through the test's `env` map.

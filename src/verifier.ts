@@ -122,6 +122,7 @@ async function observeCriterionTests(
       candidate.command,
       clock,
       perCommand,
+      candidate.env,
     );
     // Observed success is the only pass: the declared exit code is ignored here.
     if (proof.ok) continue;
@@ -312,4 +313,40 @@ export async function tryCompleteWithEvidence(args: {
     return { ok: false, reason: 'evidence-required', failures: got.failures };
   }
   return got;
+}
+
+/** How many concrete failures a blocked message quotes before it summarizes. */
+export const BLOCKED_FAILURE_LIMIT = 5;
+
+/**
+ * Build the operator/agent-facing message for a blocked completion.
+ *
+ * Why this exists: the verifier already produces precise reasons
+ * (`test-failed:<id>:exit=1`, `missing-file:<id>:<path>`, `test-budget:<id>`),
+ * but both completion lanes printed one canned sentence telling the agent to
+ * "add file citations plus passing tests" even when the citations were fine and
+ * a recorded command simply exited non-zero. The failures were built and then
+ * discarded, so the only actionable diagnosis never reached the caller.
+ * Quoting them (bounded, so a padded sidecar cannot flood the reply) makes the
+ * block self-explaining.
+ * @param reason stable verifier reason, e.g. `evidence-invalid`
+ * @param failures concrete failures produced by the verifier
+ * @returns one message with the reason plus each failure
+ */
+export function describeVerificationFailure(
+  reason: string,
+  failures: string[],
+): string {
+  const clean = (failures ?? [])
+    .filter((f) => typeof f === 'string' && f.trim().length > 0)
+    .map((f) => f.trim());
+  if (clean.length === 0) {
+    return 'Complete blocked: ' + reason + '. Add evidence and retry.';
+  }
+  const shown = clean.slice(0, BLOCKED_FAILURE_LIMIT).join('; ');
+  const more =
+    clean.length > BLOCKED_FAILURE_LIMIT
+      ? ' (+' + String(clean.length - BLOCKED_FAILURE_LIMIT) + ' more)'
+      : '';
+  return 'Complete blocked: ' + reason + ' — ' + shown + more + '.';
 }
