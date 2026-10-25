@@ -44,6 +44,7 @@ import {
   saveEvidence,
   validateEvidenceShape,
 } from './evidence.js';
+import type { EvidenceTestProof } from './evidence.js';
 import {
   describeVerificationFailure,
   tryCompleteWithEvidence,
@@ -403,9 +404,9 @@ export async function recordEvidence(
     files = bad ? [] : out;
   }
   const testsInput = Array.isArray(raw?.tests) ? raw.tests : null;
-  let tests: { command: string; exitCode: number }[] | null = null;
+  let tests: EvidenceTestProof[] | null = null;
   if (testsInput !== null) {
-    const out: { command: string; exitCode: number }[] = [];
+    const out: EvidenceTestProof[] = [];
     let bad = false;
     for (const t of testsInput) {
       if (
@@ -418,9 +419,31 @@ export async function recordEvidence(
         bad = true;
         break;
       }
+      // Carry the optional env through: dropping it here would make the schema
+      // accept a field the stored sidecar silently loses, and the proof would
+      // then run without the toolchain it asked for.
+      const rawEnv = (t as { env?: unknown }).env;
+      let env: Record<string, string> | undefined;
+      if (rawEnv !== undefined) {
+        if (
+          rawEnv === null ||
+          typeof rawEnv !== 'object' ||
+          Array.isArray(rawEnv)
+        ) {
+          bad = true;
+          break;
+        }
+        const entries = Object.entries(rawEnv as Record<string, unknown>);
+        if (entries.some(([, v]) => typeof v !== 'string')) {
+          bad = true;
+          break;
+        }
+        env = Object.fromEntries(entries) as Record<string, string>;
+      }
       out.push({
         command: ((t as { command: string }).command as string).trim(),
         exitCode: (t as { exitCode: number }).exitCode as number,
+        ...(env === undefined ? {} : { env }),
       });
     }
     tests = bad ? [] : out;
@@ -502,6 +525,7 @@ export async function recordEvidence(
           tests: tests.map((t) => ({
             command: t.command.trim(),
             exitCode: t.exitCode,
+            ...(t.env === undefined ? {} : { env: t.env }),
           })),
         },
       ],

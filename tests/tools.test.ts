@@ -383,6 +383,32 @@ describe('goal_evidence sole writer', () => {
     if (!found) throw new Error('missing tool ' + name);
     return found;
   }
+  it('tool execute parity with slash carries the optional env into the sidecar', async () => {
+    const { loadEvidence } = await import('../src/evidence.js');
+    const { writeFileSync } = await import('node:fs');
+    const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-env-'));
+    writeFileSync(path.join(dir, 'proof.txt'), 'done\n');
+    const defs = await toolDefs(dir);
+    await byName(defs, 'goal_set').execute({ title: 'env lane' }, {});
+    await byName(defs, 'goal_evidence').execute(
+      {
+        id: 'e1',
+        claim: 'env travels with the criterion',
+        files: ['proof.txt'],
+        tests: [
+          {
+            command: 'test "$GOAL_PROBE" = ok',
+            exitCode: 0,
+            env: { GOAL_PROBE: 'ok' },
+          },
+        ],
+      },
+      { sessionID: 'sess-env' },
+    );
+
+    const ev = await loadEvidence(dir, 'sess-env');
+    expect(ev?.criteria[0]?.tests[0]?.env).toEqual({ GOAL_PROBE: 'ok' });
+  });
   it('set to evidence to complete passes the gate with real proof', async () => {
     const { writeFileSync } = await import('node:fs');
     const { loadEvidence } = await import('../src/evidence.js');
