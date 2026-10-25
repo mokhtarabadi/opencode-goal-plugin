@@ -209,6 +209,13 @@ export const EvidenceInputSchema = {
         properties: {
           command: { type: 'string', minLength: 1 },
           exitCode: { type: 'integer' },
+          // Optional toolchain pin for this command only. Without this field in
+          // the tool schema the host rejects it (additionalProperties is false),
+          // which would make the runner's env support unreachable from a tool.
+          env: {
+            type: 'object',
+            additionalProperties: { type: 'string' },
+          },
         },
         required: ['command', 'exitCode'],
         additionalProperties: false,

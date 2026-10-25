@@ -115,6 +115,16 @@ describe('tool schemas', () => {
       'tests',
     ]);
     expect(EvidenceInputSchema.additionalProperties).toBe(false);
+    // A test entry may pin its own env, and only string values are allowed, so
+    // the tool schema must expose the field instead of rejecting it.
+    const tests = EvidenceInputSchema.properties.tests as {
+      items: { properties: Record<string, unknown> };
+    };
+    expect(Object.keys(tests.items.properties)).toContain('env');
+    const env = tests.items.properties['env'] as {
+      additionalProperties: { type: string };
+    };
+    expect(env.additionalProperties.type).toBe('string');
   });
 });
 
