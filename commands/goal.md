@@ -7,7 +7,7 @@ Patterns:
 - /goal status shows current state
 - /goal block <reason> marks blocked
 - /goal complete marks complete (needs evidence; the recorded test command is executed, so a declared exit code alone cannot pass)
-- /goal evidence id=<short-id> claim=<one-line claim> files=<a,b> tests=<cmd:exitCode> records one evidence criterion (sole evidence writer)
+- /goal evidence id=<short-id> claim=<one-line claim> files=<a,b> tests=<cmd:exitCode> records one evidence criterion (sole evidence writer). Re-recording an existing id amends it: the old version is kept in a visible `history` array, the verifier checks current criteria only.
 - /goal resume re-activates a parked goal (interrupted or blocked)
 - /goal clear marks cleared
   Example: /goal evidence id=build-pass claim=Build passes on a clean tree files=src/index.ts tests=npm test:0

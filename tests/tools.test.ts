@@ -451,7 +451,7 @@ describe('goal_evidence sole writer', () => {
     // landed, not that the file is absent.
     expect(readCriteria(dir)).toEqual([]);
   });
-  it('duplicate id is rejected with no second write', async () => {
+  it('repeated id amends with history instead of rejecting', async () => {
     const { loadEvidence } = await import('../src/evidence.js');
     const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-evdup-'));
     const defs = await toolDefs(dir);
@@ -465,9 +465,80 @@ describe('goal_evidence sole writer', () => {
     expect(
       (await byName(defs, 'goal_evidence').execute(input, {})).content,
     ).toContain('Criterion recorded');
-    const dup = await byName(defs, 'goal_evidence').execute(input, {});
-    expect(dup.content).toContain('already recorded');
-    expect((await loadEvidence(dir))?.criteria.length).toBe(1);
+    const amend = await byName(defs, 'goal_evidence').execute(
+      { ...input, claim: 'corrected', files: ['src/b.ts'] },
+      {},
+    );
+    expect(amend.content).toContain('Criterion amended for e1');
+    const ev = await loadEvidence(dir);
+    expect(ev?.criteria.length).toBe(1);
+    expect(ev?.criteria[0]?.claim).toBe('corrected');
+    expect(ev?.criteria[0]?.files).toEqual(['src/b.ts']);
+    expect(ev?.criteria[0]?.history?.length).toBe(1);
+    expect(ev?.criteria[0]?.history?.[0]?.files).toEqual(['src/a.ts']);
+  });
+  it('second amend appends history again within the cap', async () => {
+    const { loadEvidence } = await import('../src/evidence.js');
+    const { MAX_CRITERION_HISTORY } = await import('../src/evidence.js');
+    const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-evamend-'));
+    const defs = await toolDefs(dir);
+    await byName(defs, 'goal_set').execute({ title: 'cap' }, {});
+    const base = {
+      id: 'e1',
+      files: ['src/a.ts'],
+      tests: [{ command: 'npm test', exitCode: 0 }],
+    };
+    await byName(defs, 'goal_evidence').execute({ ...base, claim: 'v0' }, {});
+    for (let n = 1; n <= MAX_CRITERION_HISTORY + 2; n++) {
+      await byName(defs, 'goal_evidence').execute(
+        { ...base, claim: 'v' + n },
+        {},
+      );
+    }
+    const ev = await loadEvidence(dir);
+    const history = ev?.criteria[0]?.history ?? [];
+    expect(ev?.criteria[0]?.claim).toBe('v' + (MAX_CRITERION_HISTORY + 2));
+    // Oldest-first, capped: the two earliest replaced versions fell off.
+    expect(history.length).toBe(MAX_CRITERION_HISTORY);
+    expect(history[0]?.claim).toBe('v2');
+  });
+  it('amending a stale path to a real file unblocks completion', async () => {
+    const { writeFileSync } = await import('node:fs');
+    const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-evfix-'));
+    const defs = await toolDefs(dir);
+    await byName(defs, 'goal_set').execute(
+      { title: 'moved file' },
+      { sessionID: 'sess-fix' },
+    );
+    await byName(defs, 'goal_evidence').execute(
+      {
+        id: 'e1',
+        claim: 'cites the qa lane path',
+        files: ['tasks/qa/gone.md'],
+        tests: [{ command: 'node -e "process.exit(0)"', exitCode: 0 }],
+      },
+      { sessionID: 'sess-fix' },
+    );
+    const blocked = await byName(defs, 'goal_complete').execute(
+      {},
+      { sessionID: 'sess-fix' },
+    );
+    expect(blocked.content).toContain('missing-file:e1:tasks/qa/gone.md');
+    writeFileSync(path.join(dir, 'proof.txt'), 'done\n');
+    await byName(defs, 'goal_evidence').execute(
+      {
+        id: 'e1',
+        claim: 'cites the completed path',
+        files: ['proof.txt'],
+        tests: [{ command: 'node -e "process.exit(0)"', exitCode: 0 }],
+      },
+      { sessionID: 'sess-fix' },
+    );
+    const done = await byName(defs, 'goal_complete').execute(
+      {},
+      { sessionID: 'sess-fix' },
+    );
+    expect(done.content).toBe('Goal marked complete.');
   });
   it('held lease blocks evidence write without changing state', async () => {
     const { existsSync } = await import('node:fs');

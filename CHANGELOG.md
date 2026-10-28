@@ -6,6 +6,8 @@ All notable changes follow Keep a Changelog.
 
 ### Added
 
+- Re-recording an existing evidence id now amends the criterion instead of rejecting it: the previous version (claim, files, tests, `replacedAtMs`) is kept in a visible `history` array capped at 10, the verifier checks current criteria only, and the reply distinguishes `Criterion recorded` from `Criterion amended`. Closes the known limitation ADR-012 left open — a legitimately-moved citation (Kanban lane promotion, rename) is correctable in place while the audit trail stays readable.
+
 - A blocked `goal_complete` now names what failed: `describeVerificationFailure` quotes the verifier's concrete reasons (`test-failed:<id>:exit=N`, `missing-file:<id>:<path>`, `test-budget:<id>`) for both the tool and slash lanes, capped at five with `(+N more)`, instead of one canned sentence that told the agent to add citations even when the citations were fine. Reproduced live on a JDK-mismatch proof run. Evidence tests may now carry an optional flat `env` string map, validated as strings and merged into the child environment last, so a project can pin the toolchain its command actually needs. 9 new tests (including a no-leak-across-criteria check); full suite 187 green.
 
 - Evidence traversal guard rejecting dot-dot escapes.

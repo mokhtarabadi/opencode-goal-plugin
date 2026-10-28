@@ -39,7 +39,28 @@ export interface EvidenceCriterion {
   claim: string;
   files: string[];
   tests: EvidenceTestProof[];
+  /**
+   * Previous versions of this criterion, oldest first, capped by
+   * MAX_CRITERION_HISTORY. Why it exists: a legitimately-moved citation (a
+   * Kanban file promoted from qa to completed, a renamed source) must be
+   * correctable without goal_set discarding every other criterion, while the
+   * old citation stays readable so goalposts cannot move unseen. The verifier
+   * checks current criteria only and never reads this array.
+   */
+  history?: EvidenceSuperseded[];
 }
+
+/** One replaced version of a criterion, kept for audit. */
+export interface EvidenceSuperseded {
+  claim: string;
+  files: string[];
+  tests: EvidenceTestProof[];
+  /** UTC epoch ms from the injected Clock when this version was replaced. */
+  replacedAtMs: number;
+}
+
+/** Maximum kept versions per criterion, so a replace loop cannot bloat the sidecar. */
+export const MAX_CRITERION_HISTORY = 10;
 
 /** Sidecar file proving goal completion criteria. */
 export interface GoalEvidenceFile {
@@ -115,6 +136,42 @@ export function validateEvidenceShape(ev: unknown): {
       return { ok: false, reason: 'criterion-missing-files' };
     if (!Array.isArray(c['tests']) || (c['tests'] as unknown[]).length === 0)
       return { ok: false, reason: 'criterion-missing-tests' };
+    // Optional amend history: replaced versions stay readable for audit but never
+    // gate proof — the verifier ignores this array, so a stale path kept here
+    // cannot fail completion. Shape-checked so a corrupt sidecar still fails loud.
+    if (c['history'] !== undefined) {
+      if (!Array.isArray(c['history']))
+        return { ok: false, reason: 'criterion-bad-history' };
+      for (const h of c['history'] as unknown[]) {
+        if (h === null || typeof h !== 'object' || Array.isArray(h))
+          return { ok: false, reason: 'history-not-object' };
+        const e = h as Record<string, unknown>;
+        if (
+          typeof e['claim'] !== 'string' ||
+          (e['claim'] as string).length === 0
+        )
+          return { ok: false, reason: 'history-bad-claim' };
+        if (
+          !Array.isArray(e['files']) ||
+          !(e['files'] as unknown[]).every((f) => typeof f === 'string')
+        )
+          return { ok: false, reason: 'history-bad-files' };
+        if (
+          !Array.isArray(e['tests']) ||
+          !(e['tests'] as unknown[]).every(
+            (t) =>
+              t !== null &&
+              typeof t === 'object' &&
+              !Array.isArray(t) &&
+              typeof (t as Record<string, unknown>)['command'] === 'string' &&
+              typeof (t as Record<string, unknown>)['exitCode'] === 'number',
+          )
+        )
+          return { ok: false, reason: 'history-bad-tests' };
+        if (typeof e['replacedAtMs'] !== 'number')
+          return { ok: false, reason: 'history-bad-replacedAtMs' };
+      }
+    }
     // Optional env: when present it must be a flat string map, because a nested
     // value would be stringified by the shell and silently change the command.
     for (const t of c['tests'] as unknown[]) {

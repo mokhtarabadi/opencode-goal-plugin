@@ -39,6 +39,7 @@ import {
   setObjective,
 } from './goal.js';
 import {
+  MAX_CRITERION_HISTORY,
   emptyEvidence,
   loadEvidence,
   saveEvidence,
@@ -510,25 +511,44 @@ export async function recordEvidence(
     // Scoped evidence: slash plus tool lanes never share citations.
     const current =
       (await loadEvidence(projectDir, storage)) ?? emptyEvidence(0);
-    if (current.criteria.some((c) => c.id === id)) {
-      return 'Evidence id already recorded: ' + id + '.';
-    }
+    const previous = current.criteria.find((c) => c.id === id);
+    // Amend path: re-recording an existing id replaces the criterion in place
+    // (array order preserved) and keeps the old version in history (capped)
+    // instead of rejecting. A moved file (Kanban qa to completed, a rename) is
+    // correctable; the old citation stays readable so the audit trail — and
+    // the goalposts — do not move unseen. One clock read feeds both stamps.
+    const nowMs = clock.nowMs();
+    const history = [
+      ...(previous?.history ?? []),
+      ...(previous === undefined
+        ? []
+        : [
+            {
+              claim: previous.claim,
+              files: previous.files,
+              tests: previous.tests,
+              replacedAtMs: nowMs,
+            },
+          ]),
+    ].slice(-MAX_CRITERION_HISTORY);
+    const replacement = {
+      id,
+      claim,
+      files,
+      tests: tests.map((t) => ({
+        command: t.command.trim(),
+        exitCode: t.exitCode,
+        ...(t.env === undefined ? {} : { env: t.env }),
+      })),
+      ...(history.length === 0 ? {} : { history }),
+    };
     const candidate = {
       version: current.version,
-      updatedAtMs: clock.nowMs(),
-      criteria: [
-        ...current.criteria,
-        {
-          id,
-          claim,
-          files,
-          tests: tests.map((t) => ({
-            command: t.command.trim(),
-            exitCode: t.exitCode,
-            ...(t.env === undefined ? {} : { env: t.env }),
-          })),
-        },
-      ],
+      updatedAtMs: nowMs,
+      criteria:
+        previous === undefined
+          ? [...current.criteria, replacement]
+          : current.criteria.map((c) => (c.id === id ? replacement : c)),
     };
     // Full-file shape check reuses the verifier's own gate shape.
     const shape = validateEvidenceShape(candidate);
@@ -540,7 +560,9 @@ export async function recordEvidence(
     } catch (err) {
       return 'Failed to save evidence: ' + (err as Error).message;
     }
-    return 'Criterion recorded for ' + id + '.';
+    return previous === undefined
+      ? 'Criterion recorded for ' + id + '.'
+      : 'Criterion amended for ' + id + ' (previous version kept in history).';
   } finally {
     await claimRes.release();
   }

@@ -38,6 +38,80 @@ describe('evidence schema', () => {
   it('rejects bad version', () => {
     expect(validateEvidenceShape({ version: 2, criteria: [] }).ok).toBe(false);
   });
+  it('accepts amend history and still gates current files only', () => {
+    const ev = {
+      version: 1 as const,
+      updatedAtMs: 1700000000000,
+      criteria: [
+        {
+          id: 'c1',
+          claim: 'moved to completed',
+          files: ['tasks/completed/fix.md'],
+          tests: [{ command: 'npm test', exitCode: 0 }],
+          history: [
+            {
+              claim: 'cited the qa lane',
+              files: ['tasks/qa/fix.md'],
+              tests: [{ command: 'npm test', exitCode: 0 }],
+              replacedAtMs: 1700000000001,
+            },
+          ],
+        },
+      ],
+    };
+    expect(validateEvidenceShape(ev).ok).toBe(true);
+  });
+  it('rejects corrupt history entries', () => {
+    const bad = (history: unknown) => ({
+      version: 1 as const,
+      updatedAtMs: 1700000000000,
+      criteria: [
+        {
+          id: 'c1',
+          claim: 'x',
+          files: ['a'],
+          tests: [{ command: 't', exitCode: 0 }],
+          history,
+        },
+      ],
+    });
+    expect(validateEvidenceShape(bad('nope')).ok).toBe(false);
+    expect(
+      validateEvidenceShape(bad([{ claim: '', files: [], tests: [] }])).ok,
+    ).toBe(false);
+    expect(
+      validateEvidenceShape(
+        bad([{ claim: 'x', files: [], tests: [], replacedAtMs: 'now' }]),
+      ).ok,
+    ).toBe(false);
+  });
+  it('rejects history entries with loose inner shapes', () => {
+    const base = {
+      claim: 'x',
+      files: ['a'],
+      tests: [{ command: 't', exitCode: 0 }],
+      replacedAtMs: 1,
+    };
+    const bad = (history: unknown) => ({
+      version: 1 as const,
+      updatedAtMs: 1700000000000,
+      criteria: [
+        {
+          id: 'c1',
+          claim: 'x',
+          files: ['a'],
+          tests: [{ command: 't', exitCode: 0 }],
+          history,
+        },
+      ],
+    });
+    expect(validateEvidenceShape(bad([{ ...base, files: [42] }])).ok).toBe(
+      false,
+    );
+    expect(
+      validateEvidenceShape(bad([{ ...base, tests: [{ exitCode: 0 }] }])).ok,
+    ).toBe(false);
+  });
 });
 
 describe('evidence legacy fallback boundary', () => {
