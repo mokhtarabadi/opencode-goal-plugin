@@ -55,6 +55,7 @@ import { recordEvidence, registerGoalTools } from './tools.js';
 import {
   armWatchdog,
   clearWatchdog,
+  clearAllWatchdogs,
   rearmFromState,
   _resetWatchdogsForTests,
 } from './watchdog.js';
@@ -1245,12 +1246,18 @@ export default Plugin.define({
       // Hook registration is best-effort on hosts without these hooks.
     }
 
-    // Cleanup on unload: stop the event stream.
+    // Cleanup on unload: stop the event stream and clear watchdog timers.
     return () => {
       try {
         controller.abort();
       } catch {
         // Abort is best-effort during unload.
+      }
+      try {
+        // Clear all watchdog timers so none leak after unload.
+        clearAllWatchdogs();
+      } catch {
+        // Best-effort only.
       }
       try {
         // Clear tracked controllers so no stale listener survives unload.

@@ -117,9 +117,11 @@ export function rearmFromState(
 }
 
 /**
- * Reset all timers for tests only.
+ * Clear every armed watchdog timer.
+ * Why public (not test-only): the plugin setup() cleanup uses this on unload
+ * so watchdog timers never leak across host reloads.
  */
-export function _resetWatchdogsForTests(): void {
+export function clearAllWatchdogs(): void {
   for (const entry of watchdogHandles.values()) {
     try {
       clearTimeout(entry.timer as ReturnType<typeof setTimeout>);
@@ -128,6 +130,13 @@ export function _resetWatchdogsForTests(): void {
     }
   }
   watchdogHandles.clear();
+}
+
+/**
+ * Reset all timers for tests only.
+ */
+export function _resetWatchdogsForTests(): void {
+  clearAllWatchdogs();
 }
 
 /**
