@@ -1,9 +1,10 @@
 # Task 016: Audit fixes for opencode-goal-plugin (meta)
 
-**File:** `tasks/qa/016-audit-fixes-goal-plugin-meta.md`
+**File:** `tasks/completed/016-audit-fixes-goal-plugin-meta.md`
 **Source:** manager
 **Type:** improvement
-**Status:** open
+**Status:** closed
+**Finished:** 2026-10-31T06:40:32Z
 **Meta:** true
 
 ## Source Context
@@ -78,83 +79,5 @@ Audit verdict: PASS_WITH_WARNINGS. Key issues:
 ## Factual Git Diff
 
 <!-- BEGIN_GIT_DIFF -->
-```diff
-diff --git a/package.json b/package.json
-index 8c0ed19..43b40f8 100644
---- a/package.json
-+++ b/package.json
-@@ -28,6 +28,6 @@
-     "vitest": "^2.0.0"
-   },
-   "dependencies": {
--    "@opencode/plugin": "^2.0.19"
-+    "@opencode/plugin": "^2.0.28"
-   }
- }
-diff --git a/src/index.ts b/src/index.ts
-index 1539c11..225ce09 100644
---- a/src/index.ts
-+++ b/src/index.ts
-@@ -55,6 +55,7 @@ import { recordEvidence, registerGoalTools } from './tools.js';
- import {
-   armWatchdog,
-   clearWatchdog,
-+  clearAllWatchdogs,
-   rearmFromState,
-   _resetWatchdogsForTests,
- } from './watchdog.js';
-@@ -1245,13 +1246,19 @@ export default Plugin.define({
-       // Hook registration is best-effort on hosts without these hooks.
-     }
- 
--    // Cleanup on unload: stop the event stream.
-+    // Cleanup on unload: stop the event stream and clear watchdog timers.
-     return () => {
-       try {
-         controller.abort();
-       } catch {
-         // Abort is best-effort during unload.
-       }
-+      try {
-+        // Clear all watchdog timers so none leak after unload.
-+        clearAllWatchdogs();
-+      } catch {
-+        // Best-effort only.
-+      }
-       try {
-         // Clear tracked controllers so no stale listener survives unload.
-         for (const c of idleAbortControllers) {
-diff --git a/src/watchdog.ts b/src/watchdog.ts
-index 0dd20ca..60757a4 100644
---- a/src/watchdog.ts
-+++ b/src/watchdog.ts
-@@ -117,9 +117,11 @@ export function rearmFromState(
- }
- 
- /**
-- * Reset all timers for tests only.
-+ * Clear every armed watchdog timer.
-+ * Why public (not test-only): the plugin setup() cleanup uses this on unload
-+ * so watchdog timers never leak across host reloads.
-  */
--export function _resetWatchdogsForTests(): void {
-+export function clearAllWatchdogs(): void {
-   for (const entry of watchdogHandles.values()) {
-     try {
-       clearTimeout(entry.timer as ReturnType<typeof setTimeout>);
-@@ -130,6 +132,13 @@ export function _resetWatchdogsForTests(): void {
-   watchdogHandles.clear();
- }
- 
-+/**
-+ * Reset all timers for tests only.
-+ */
-+export function _resetWatchdogsForTests(): void {
-+  clearAllWatchdogs();
-+}
-+
- /**
-  * Read the count of armed watchdogs for diagnostics and tests.
-  */
-```
+**Factual Git Diff:** Stored in Commit Hash: `9e3b5a4ee6b6771eb6ede1a618a39615512903c0`
 <!-- END_GIT_DIFF -->
