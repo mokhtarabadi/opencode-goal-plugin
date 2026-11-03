@@ -5,6 +5,7 @@
  * Local checks run first; an optional host subagent runs second. Any error keeps the goal active.
  */
 import { promises as fs } from 'node:fs';
+import type { Dirent } from 'node:fs';
 import path from 'node:path';
 import type { EvidenceCriterion, GoalEvidenceFile } from './evidence.js';
 import { validateEvidenceShape, hashEvidence } from './evidence.js';
@@ -63,6 +64,200 @@ export interface LocalVerifyResult {
   ok: boolean;
   reason: string;
   failures: string[];
+  /**
+   * Which project path satisfied each accepted file citation, in evidence order.
+   * Why this field exists: a citation that moved inside the project (a Kanban
+   * lane promotion, a rename) still proves the criterion, but the operator must
+   * be told which path actually answered it instead of guessing.
+   */
+  citations?: ResolvedCitation[];
+}
+
+/** One accepted file citation plus the project path that satisfied it. */
+export interface ResolvedCitation {
+  /** Criterion the citation belongs to. */
+  criterionId: string;
+  /** Path exactly as recorded in the evidence sidecar. */
+  cited: string;
+  /** Project-relative path (forward slashes) that satisfied the citation. */
+  resolved: string;
+  /** True when `resolved` differs from the recorded path (the file moved). */
+  moved: boolean;
+}
+
+/**
+ * Directory names a basename citation search never descends into.
+ * Why this list: build output and dependency trees are large, generated, and
+ * never the file a criterion cites, so skipping them keeps the search cheap on
+ * a big repository without weakening the guard (the search stays inside the
+ * project root either way).
+ */
+const BASENAME_SKIP_DIRS = new Set([
+  '.git',
+  '.opencode',
+  'node_modules',
+  'dist',
+  'build',
+  'coverage',
+  '.next',
+  '.venv',
+  'venv',
+  'target',
+  '__pycache__',
+]);
+
+/**
+ * Maximum directory entries one basename search examines before it gives up.
+ * Why a cap at all: completion must stay bounded on a huge repository, so a
+ * pathological tree cannot stall the proof pass. 50 000 entries comfortably
+ * covers a large source tree once dependency, virtualenv and build directories
+ * are skipped, and a deleted file still yields zero matches inside the cap,
+ * which is the fail-closed answer this feature must preserve.
+ */
+export const BASENAME_SCAN_LIMIT = 50000;
+
+/** Maximum directory depth one basename search descends. */
+const BASENAME_MAX_DEPTH = 12;
+
+/** Maximum matches collected before a search stops: enough to prove ambiguity. */
+const BASENAME_MATCH_LIMIT = 32;
+
+/** How many candidate paths an ambiguity failure names before summarizing. */
+export const AMBIGUOUS_CANDIDATE_LIMIT = 5;
+
+/**
+ * Render one absolute path as a project-relative, forward-slash path.
+ * Why normalize: failure strings and citations travel between platforms, so a
+ * Windows backslash must not make the same file look like a different one.
+ * @param base absolute project root
+ * @param absolute absolute path inside the project
+ */
+function toProjectRelative(base: string, absolute: string): string {
+  return path.relative(base, absolute).split(path.sep).join('/');
+}
+
+/**
+ * Find every file under the project whose basename matches exactly.
+ * Why basename only: a citation is a path, but the file's identity survives a
+ * move; the exact path is tried first and this search only runs after it missed.
+ * Deterministic order (sorted entries, depth first) so an ambiguity report is
+ * stable, and bounded by an entry cap plus a depth cap so a huge tree cannot
+ * stall completion. Symlinks are skipped so a cycle cannot loop forever.
+ * @param projectDir absolute project root
+ * @param basename file name to match, e.g. `16-foo.md`
+ */
+async function findFilesByBasename(
+  projectDir: string,
+  basename: string,
+): Promise<string[]> {
+  const base = path.resolve(projectDir);
+  const matches: string[] = [];
+  let seen = 0;
+  const walk = async (dir: string, depth: number): Promise<void> => {
+    if (depth > BASENAME_MAX_DEPTH || seen > BASENAME_SCAN_LIMIT) return;
+    if (matches.length >= BASENAME_MATCH_LIMIT) return;
+    let entries: Dirent[];
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      // Unreadable directory: it simply contributes no match.
+      return;
+    }
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    for (const entry of entries) {
+      seen += 1;
+      if (seen > BASENAME_SCAN_LIMIT) return;
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) {
+        if (BASENAME_SKIP_DIRS.has(entry.name)) continue;
+        await walk(path.join(dir, entry.name), depth + 1);
+        if (matches.length >= BASENAME_MATCH_LIMIT) return;
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (entry.name !== basename) continue;
+      matches.push(toProjectRelative(base, path.join(dir, entry.name)));
+      if (matches.length >= BASENAME_MATCH_LIMIT) return;
+    }
+  };
+  await walk(base, 0);
+  return matches;
+}
+
+/**
+ * Resolve one citation to a real file without ever leaving the project.
+ * Why this order: an exact path is unambiguous, so it always wins and never
+ * costs a tree walk. Only a miss triggers the basename search, and that search
+ * accepts a hit only when it is unique — guessing between two same-named files
+ * would prove the wrong file, so ambiguity is reported as a failure that names
+ * the candidates. No match at all keeps the historical `missing-file`.
+ * @param projectDir absolute project root
+ * @param criterionId criterion the citation belongs to
+ * @param cited path exactly as recorded in the evidence sidecar
+ */
+async function resolveCitation(
+  projectDir: string,
+  criterionId: string,
+  cited: string,
+): Promise<{ citation: ResolvedCitation | null; failure: string | null }> {
+  const base = path.resolve(projectDir);
+  const target = path.isAbsolute(cited) ? cited : path.join(projectDir, cited);
+  try {
+    // Require a real file: directories and missing paths both fail proof.
+    const st = await fs.stat(target);
+    if (!st.isFile()) {
+      return {
+        citation: null,
+        failure: 'not-a-file:' + criterionId + ':' + cited,
+      };
+    }
+    return {
+      citation: {
+        criterionId,
+        cited,
+        resolved: toProjectRelative(base, target),
+        moved: false,
+      },
+      failure: null,
+    };
+  } catch {
+    // Missing exact path: try identity by basename before failing below.
+  }
+  const basename = path.basename(cited);
+  if (basename === '' || basename === '.' || basename === '..') {
+    return {
+      citation: null,
+      failure: 'missing-file:' + criterionId + ':' + cited,
+    };
+  }
+  const matches = await findFilesByBasename(projectDir, basename);
+  if (matches.length === 0) {
+    return {
+      citation: null,
+      failure: 'missing-file:' + criterionId + ':' + cited,
+    };
+  }
+  if (matches.length === 1) {
+    return {
+      citation: {
+        criterionId,
+        cited,
+        resolved: matches[0],
+        moved: true,
+      },
+      failure: null,
+    };
+  }
+  const named = matches.slice(0, AMBIGUOUS_CANDIDATE_LIMIT).join(',');
+  const more =
+    matches.length > AMBIGUOUS_CANDIDATE_LIMIT
+      ? '(+' + String(matches.length - AMBIGUOUS_CANDIDATE_LIMIT) + ' more)'
+      : '';
+  return {
+    citation: null,
+    failure:
+      'ambiguous-citation:' + criterionId + ':' + cited + ':' + named + more,
+  };
 }
 
 /**
@@ -177,6 +372,9 @@ export async function verifyLocal(
   if (!shape.ok)
     return { ok: false, reason: shape.reason, failures: [shape.reason] };
   const failures: string[] = [];
+  const citations: ResolvedCitation[] = [];
+  // Spot-moved citations so the success path can name the path that proved them.
+  const movedCitations: string[] = [];
   // Shared command budget across all criteria for this verification pass.
   const executed = { count: 0 };
   // One deadline per pass so a padded sidecar cannot run for hours.
@@ -189,15 +387,20 @@ export async function verifyLocal(
         failures.push('traversal-escape:' + c.id + ':' + String(f));
         continue;
       }
-      try {
-        // Require a real file: directories and missing paths both fail proof.
-        const p = path.isAbsolute(f) ? f : path.join(projectDir, f);
-        const st = await fs.stat(p);
-        if (!st.isFile()) {
-          failures.push('not-a-file:' + c.id + ':' + String(f));
+      // Exact path first, then a unique basename hit; ambiguity and no match
+      // both stay failures so a deleted file can never pass as a move.
+      const resolved = await resolveCitation(projectDir, c.id, String(f));
+      if (resolved.failure !== null) {
+        failures.push(resolved.failure);
+        continue;
+      }
+      if (resolved.citation !== null) {
+        citations.push(resolved.citation);
+        if (resolved.citation.moved) {
+          movedCitations.push(
+            resolved.citation.cited + '->' + resolved.citation.resolved,
+          );
         }
-      } catch {
-        failures.push('missing-file:' + c.id + ':' + String(f));
       }
     }
     if (opts?.runTests === true) {
@@ -222,8 +425,19 @@ export async function verifyLocal(
     }
   }
   if (failures.length > 0)
-    return { ok: false, reason: 'evidence-invalid', failures };
-  return { ok: true, reason: 'ok:' + hashEvidence(evidence), failures: [] };
+    return { ok: false, reason: 'evidence-invalid', failures, citations };
+  // Name every moved citation on the success path: the proof is accepted, but
+  // the operator still learns which path answered a citation that had moved.
+  const movedNote =
+    movedCitations.length === 0
+      ? ''
+      : ' moved-citations:' + movedCitations.join(', ');
+  return {
+    ok: true,
+    reason: 'ok:' + hashEvidence(evidence) + movedNote,
+    failures: [],
+    citations,
+  };
 }
 
 /**
@@ -264,6 +478,7 @@ export async function verifyCompletion(args: {
         ok: true,
         reason: 'subagent-pass:' + local.reason,
         failures: [],
+        citations: local.citations,
       };
     return {
       ok: false,

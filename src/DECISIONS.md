@@ -21,6 +21,8 @@ reader inside `src/` finds the reasoning without leaving the folder.
 | ADR-011 completion observes test results         | `proof.ts`, `verifier.ts`, `tools.ts`, `index.ts`            |
 | ADR-012 set resets the evidence sidecar          | `tools.ts`, `index.ts`, `evidence.ts`                        |
 | ADR-013 scoped evidence ends the legacy fallback | `evidence.ts`, `tools.ts`, `index.ts`                        |
+| ADR-015 re-recording an id amends it             | `tools.ts`, `evidence.ts`                                    |
+| ADR-016 idle human-gate park + movable citations | `loop.ts`, `goal.ts`, `state.ts`, `index.ts`, `verifier.ts`  |
 
 ## Local notes
 

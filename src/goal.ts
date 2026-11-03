@@ -361,6 +361,23 @@ export function setObjective(
 }
 
 /**
+ * Clear the idle-park latch plus its no-progress counter and stamp.
+ * Why this helper exists: an explicit transition (block, complete, clear,
+ * resume) means a human or an agent decided something, so the loop has no
+ * human gate left to wait on and must start its streak over. Resetting the
+ * stamp also removes the stale "the goal changed" signal, which would otherwise
+ * credit the next turn with progress it did not make.
+ */
+function clearIdlePark(): Partial<GoalState> {
+  return {
+    idleParked: false,
+    noProgressTurns: 0,
+    lastTurnKey: '',
+    lastScoredTurnId: '',
+  };
+}
+
+/**
  * Mark active goal as blocked with reason in lastSummary.
  * @param current current state must be active
  * @param reason block reason
@@ -376,6 +393,7 @@ export function blockGoal(
   }
   return {
     ...current,
+    ...clearIdlePark(),
     status: 'blocked',
     lastSummary: reason,
     leaseOwner: null,
@@ -395,6 +413,7 @@ export function completeGoal(current: GoalState, clock: Clock): GoalState {
   }
   return {
     ...current,
+    ...clearIdlePark(),
     status: 'complete',
     leaseOwner: null,
     leaseExpiresAtMs: 0,
@@ -410,6 +429,7 @@ export function completeGoal(current: GoalState, clock: Clock): GoalState {
 export function clearGoal(current: GoalState, clock: Clock): GoalState {
   return {
     ...current,
+    ...clearIdlePark(),
     status: 'cleared',
     leaseOwner: null,
     leaseExpiresAtMs: 0,
@@ -422,16 +442,25 @@ export function clearGoal(current: GoalState, clock: Clock): GoalState {
  * Why this exists: a user abort parks the goal as interrupted, and the only
  * path back is an explicit /goal resume. Blocked goals can also be resumed.
  * Clears any stale retry so the watchdog does not fire against a fresh start.
- * @param current current state, must be interrupted or blocked
+ * An active goal behind the idle-park latch also resumes: the loop, not the
+ * lifecycle, was stopped, and this is the one verb that turns it back on.
+ * @param current current state, must be interrupted, blocked, or idle-parked
  * @param clock injected clock
  */
 export function resumeGoal(current: GoalState, clock: Clock): GoalState {
-  // Only a parked goal can resume; active and finished states are no-ops.
-  if (current.status !== 'interrupted' && current.status !== 'blocked') {
+  // Only a parked goal can resume; active and finished states are no-ops,
+  // except an active goal whose auto-continue loop parked for human input.
+  const idleParked = current.idleParked === true;
+  if (
+    current.status !== 'interrupted' &&
+    current.status !== 'blocked' &&
+    !(current.status === 'active' && idleParked)
+  ) {
     throw new Error('only a parked goal can resume');
   }
   return {
     ...current,
+    ...clearIdlePark(),
     status: 'active',
     pendingAttempt: null,
     recoveryEpoch: current.recoveryEpoch + 1,

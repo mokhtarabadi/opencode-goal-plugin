@@ -66,6 +66,13 @@ export interface IdleContext {
    * sessions in one project proceed independently.
    */
   sessionId?: string | null;
+  /**
+   * Observation of the assistant turn our last continuation started.
+   * Why optional exists: only the host wiring can see tool events, and older
+   * callers (plus hosts that never report tool activity) pass nothing. An
+   * absent observation is never scored, so the park latch cannot fire blind.
+   */
+  lastTurn?: TurnObservation | null;
 }
 
 /** Discriminated result of one send attempt. */
@@ -96,6 +103,13 @@ export interface IdleDeps {
     prompt: string,
   ) => Promise<SendResult | { messageId: string; tokenSpend?: number }>;
   hasStopFile: () => Promise<boolean>;
+  /**
+   * Optional hook fired after a continuation prompt was sent.
+   * Why this exists: the host wiring tracks the turn that continuation starts
+   * (tool calls, the `question` tool) and cannot know when the next turn begins
+   * without this signal. A send failure never fires it.
+   */
+  onContinuationSent?: (messageId: string) => void;
   /**
    * Optional hook fired after a turn ends, success or failure.
    * Why this exists: the host clears the watchdog on success and re-arms it on
@@ -167,6 +181,182 @@ function safeSpend(v: unknown): number {
  * wake later than TTL would let another process reclaim first.
  */
 export const DEFAULT_MAX_TURN_MS = 90000;
+
+/**
+ * Consecutive no-progress continuation turns before the loop parks for input.
+ * Why 2: one empty turn is a normal end-of-turn (a summary, a status line), so
+ * parking on it would punish a productive loop; two in a row means the agent is
+ * waiting on something the loop cannot supply. The task allows 2-3, and the
+ * park message itself is recoverable with one `goal_resume` or `goal_set`.
+ */
+export const IDLE_PARK_THRESHOLD = 2;
+
+/**
+ * Observation of the assistant turn started by one continuation prompt.
+ * Why this shape exists: the pure loop cannot see the host event stream, so the
+ * wiring reports what it observed and this module decides. `turnId` is the
+ * continuation message id, which makes scoring idempotent: a replayed
+ * observation for a turn already scored no longer matches the current
+ * continuation and is ignored.
+ */
+export interface TurnObservation {
+  /** Continuation message id that started the observed turn. */
+  turnId: string;
+  /** True when the turn invoked at least one tool. */
+  usedTool: boolean;
+  /** True when the turn asked the human a question (the `question` tool). */
+  askedQuestion: boolean;
+}
+
+/** Result of folding one observation into the no-progress streak. */
+export interface TurnScore {
+  /** True when the observation belonged to the current continuation. */
+  scored: boolean;
+  /** True when the turn did real work (a tool call or a state change). */
+  productive: boolean;
+  /** Consecutive no-progress turns after this score. */
+  noProgressTurns: number;
+  /** True when the scored turn asked the human a question. */
+  questionAsked: boolean;
+  /** True when the loop should stop and post its one idle message. */
+  parkRequested: boolean;
+}
+
+/**
+ * Stamp of the fields only a real transition writes.
+ * Why this list: loop bookkeeping (iteration count is written by the loop
+ * itself, so it is stamped from the saved state) must never look like progress,
+ * while any tool or slash mutation changes at least one field here. Claim and
+ * send timestamps are excluded on purpose because a skipped tick rewrites them.
+ * @param state goal state to stamp
+ */
+export function progressKey(state: GoalState): string {
+  return [
+    state.objective,
+    String(state.createdAtMs),
+    state.status,
+    String(state.iterationCount),
+    String(state.recoveryEpoch),
+    state.lastSummary,
+    String(state.revisionCount),
+    String(state.wrapupSent),
+    String(state.pendingVerification),
+    state.verificationFailReason ?? '',
+    state.evidenceHash ?? '',
+  ].join('|');
+}
+
+/**
+ * Fold one turn observation into the consecutive no-progress streak.
+ * Why pure: the park decision must be testable without a host, a clock, or disk.
+ * Rules: an observation for any turn other than the current continuation is
+ * ignored (idempotent replay); a tool call or a state change resets the streak;
+ * the `question` tool parks on the next tick regardless of the threshold,
+ * because asking the human is the explicit human gate.
+ * @param state current goal state
+ * @param turn observation reported by the host wiring, null when unknown
+ */
+export function scoreContinuationTurn(
+  state: GoalState,
+  turn: TurnObservation | null | undefined,
+): TurnScore {
+  const unchanged: TurnScore = {
+    scored: false,
+    productive: false,
+    noProgressTurns: state.noProgressTurns,
+    questionAsked: false,
+    // Keep an existing latch: no observation must never silently unpark.
+    parkRequested: state.idleParked === true,
+  };
+  if (turn === null || turn === undefined) return unchanged;
+  if (typeof turn.turnId !== 'string' || turn.turnId.length === 0) {
+    return unchanged;
+  }
+  // Only the turn our last continuation started may be scored. Anything else is
+  // a stale replay or a human-initiated turn the loop must not judge.
+  if (state.lastContinuedMessageId === '') return unchanged;
+  if (turn.turnId !== state.lastContinuedMessageId) return unchanged;
+  // Already scored: a parked goal sends no new continuation, so the host keeps
+  // replaying the same observation. Scoring it twice would re-park the goal in
+  // the tick that a human answer just unparked.
+  if (state.lastScoredTurnId !== '' && turn.turnId === state.lastScoredTurnId) {
+    return unchanged;
+  }
+  const stateChanged =
+    state.lastTurnKey !== '' && progressKey(state) !== state.lastTurnKey;
+  const productive = turn.usedTool === true || stateChanged;
+  const questionAsked = turn.askedQuestion === true;
+  if (productive) {
+    return {
+      scored: true,
+      productive: true,
+      noProgressTurns: 0,
+      questionAsked,
+      // A question tool is an explicit human gate even when the turn did real
+      // work: the agent is asking, not progressing, so the loop must park.
+      parkRequested: questionAsked,
+    };
+  }
+  const count = state.noProgressTurns + 1;
+  return {
+    scored: true,
+    productive: false,
+    noProgressTurns: count,
+    questionAsked,
+    parkRequested: questionAsked || count >= IDLE_PARK_THRESHOLD,
+  };
+}
+
+/**
+ * Fold one host tool event into the pending turn observation.
+ * Why this helper exists: the wiring must decide whether the running turn used
+ * a tool and whether it asked the human a question, and that rule belongs next
+ * to the park policy instead of inside the event loop. It never invents a turn:
+ * without a continuation to attach to, the event is ignored.
+ * @param turn pending observation for the lane, null when no turn is watched
+ * @param toolName tool name reported by the host event, when the host sends one
+ */
+export function observeToolCall(
+  turn: TurnObservation | null | undefined,
+  toolName?: string | null,
+): TurnObservation | null {
+  if (turn === null || turn === undefined) return null;
+  return {
+    ...turn,
+    usedTool: true,
+    askedQuestion: turn.askedQuestion === true || toolName === 'question',
+  };
+}
+
+/**
+ * Build the one message posted when the loop parks for human input.
+ * Why it names the verbs: the operator has exactly two useful moves, answer the
+ * open question or park the goal explicitly, and a vague notice leaves the goal
+ * burning turns anyway. It never claims a new status; the goal stays active.
+ * @param state active goal state the loop parked on
+ * @param noProgressTurns consecutive unproductive turns that tripped the park
+ * @param questionAsked true when the turn asked the human a direct question
+ */
+export function buildIdleParkPrompt(
+  state: GoalState,
+  noProgressTurns: number,
+  questionAsked = false,
+): string {
+  const why = questionAsked
+    ? 'the last turn asked for a decision and no answer has arrived.'
+    : String(noProgressTurns) +
+      ' consecutive turn(s) ended with no tool call and no goal state change.';
+  return (
+    'Goal idle awaiting input: "' +
+    state.objective +
+    '"\n' +
+    'The auto-continue loop paused: ' +
+    why +
+    '\n' +
+    'Answer the open question, or call goal_block <reason> to park the goal explicitly. ' +
+    'Call goal_resume to revive this loop later.'
+  );
+}
 
 /**
  * Build or extend a pending continuation attempt after a failed turn.
@@ -443,6 +633,136 @@ async function settleFailedSend(
 }
 
 /**
+ * Send one stop message exactly once, under the file lease.
+ * Why shared: the budget wrap-up and the idle park both mean "claim, send once,
+ * persist the latch, settle". A second copy of that sequence would sooner or
+ * later drift and let one path send twice or skip the retry bookkeeping.
+ * A failed send never flips the latch: the pending attempt is persisted so the
+ * watchdog can wake the loop and the message is retried.
+ * @param args state path, state at claim time, deps, prompt, reason, latch writer
+ */
+async function sendOneShotStop(args: {
+  statePath: string;
+  state: GoalState;
+  deps: IdleDeps;
+  prompt: string;
+  successReason: string;
+  mark: (state: GoalState) => GoalState;
+}): Promise<IdleDecision> {
+  const { statePath, state, deps, prompt, successReason, mark } = args;
+  // Claim the lease so the one-shot send stays single-flight like any turn.
+  let claimed: { claimed: boolean; state: GoalState | null } | null = null;
+  try {
+    claimed = await deps.tryClaim(
+      statePath,
+      deps.ownerId,
+      LEASE_TTL_MS,
+      deps.clock,
+    );
+  } catch {
+    claimed = null;
+  }
+  // Lease not held: skip this tick without flipping the latch so the message can
+  // still be posted later. A lost lease must not consume the one shot.
+  if (claimed === null || !claimed.claimed) {
+    return { decision: 'skipped', reason: 'lease-held' };
+  }
+  const now = deps.clock.nowMs();
+  let sentOk = false;
+  try {
+    sentOk = normalizeSendResult(await deps.sendPrompt(prompt)).success;
+  } catch {
+    // A thrown send is a failure: do not flip the latch.
+    sentOk = false;
+  }
+  if (sentOk) {
+    try {
+      await deps.saveState(statePath, {
+        ...mark(state),
+        leaseOwner: null,
+        leaseExpiresAtMs: 0,
+        updatedAtMs: now,
+      });
+    } catch {
+      // Bookkeeping failure never changes the terminal verdict.
+    }
+    // A delivered stop message clears any watchdog: the lane is settled.
+    try {
+      deps.onTurnSettled?.({ ok: true, deadlineMs: null });
+    } catch {
+      // Settle hook is best-effort.
+    }
+    return { decision: 'stopped', reason: successReason };
+  }
+  // Send failed: record a retry attempt and stop without flipping the latch.
+  const pending = buildPendingAttempt(state, 'provider-error', now);
+  try {
+    await deps.saveState(statePath, {
+      ...state,
+      pendingAttempt: pending,
+      failureCount: state.failureCount + 1,
+      leaseOwner: null,
+      leaseExpiresAtMs: 0,
+      updatedAtMs: now,
+    });
+  } catch {
+    // Cleanup failure keeps the send failure as the reported reason.
+  }
+  // A failed stop send re-arms the watchdog so it can be retried.
+  try {
+    deps.onTurnSettled?.({ ok: false, deadlineMs: pending.deadlineMs });
+  } catch {
+    // Settle hook is best-effort.
+  }
+  return { decision: 'stopped', reason: 'send-failed' };
+}
+
+/**
+ * Clear the idle park latch because a human message arrived after the park.
+ * Why a claim: this is a real state write and must not race an idle tick or a
+ * tool mutation. A lost lease leaves the latch for the next tick to clear.
+ * @param statePath absolute goal state path
+ * @param state parked state at load time
+ * @param deps injected clock plus storage
+ */
+async function unparkOnHumanInput(
+  statePath: string,
+  state: GoalState,
+  deps: IdleDeps,
+): Promise<{ ok: boolean; state: GoalState | null }> {
+  let claimed: { claimed: boolean; state: GoalState | null };
+  try {
+    claimed = await deps.tryClaim(
+      statePath,
+      deps.ownerId,
+      LEASE_TTL_MS,
+      deps.clock,
+    );
+  } catch {
+    return { ok: false, state: null };
+  }
+  if (!claimed.claimed) return { ok: false, state: null };
+  const now = deps.clock.nowMs();
+  // Prefer the claimant's snapshot: the pre-claim load may be stale.
+  const base = claimed.state ?? state;
+  const next: GoalState = {
+    ...base,
+    idleParked: false,
+    noProgressTurns: 0,
+    leaseOwner: null,
+    leaseExpiresAtMs: 0,
+    updatedAtMs: now,
+  };
+  try {
+    await deps.saveState(statePath, next);
+  } catch {
+    // The TTL reclaims the lease this claim took: report the tick as skipped.
+    return { ok: false, state: null };
+  }
+  return { ok: true, state: next };
+}
+
+/**
  * Build the one-time wrap-up prompt sent when a budget is exhausted.
  * Why this exists: the loop must tell the agent to stop cleanly instead of
  * dying silently. Sent at most once, then the persisted flag blocks re-entry.
@@ -467,14 +787,15 @@ export function buildWrapupPrompt(state: GoalState, reason: string): string {
  * @param nowMs injected now in epoch ms
  * @param lastMessageId last observed session message id
  * @param limits active limits
- * @param opts stopRequested is true when STOP_GOAL exists
+ * @param opts stopRequested is true when STOP_GOAL exists; humanSpoke is true
+ * when a message newer than our last continuation arrived after the park
  */
 export function shouldContinue(
   state: GoalState | null,
   nowMs: number,
   lastMessageId: string | null,
   limits: Limits,
-  opts?: { stopRequested?: boolean },
+  opts?: { stopRequested?: boolean; humanSpoke?: boolean },
 ): { ok: boolean; reason: string } {
   if (state === null) return { ok: false, reason: 'no-state' };
   if (state.status !== 'active')
@@ -485,6 +806,12 @@ export function shouldContinue(
   if (state.pendingVerification === true)
     return { ok: false, reason: 'verification-pending' };
   if (opts?.stopRequested === true) return { ok: false, reason: 'stop-file' };
+  // Idle park: the loop already posted its one message for this human gate, so
+  // no further turn is spent until the human answers or an explicit resume
+  // clears the latch. The goal itself stays active throughout.
+  if (state.idleParked === true && opts?.humanSpoke !== true) {
+    return { ok: false, reason: 'idle-awaiting-input' };
+  }
   // A message id that moved past our last continuation means the human spoke: yield.
   if (
     state.lastContinuedMessageId !== '' &&
@@ -664,7 +991,7 @@ export async function handleSessionIdle(
     } catch {
       return { decision: 'stopped', reason: 'corrupt-state' };
     }
-    const now = deps.clock.nowMs();
+    let now = deps.clock.nowMs();
     let stopRequested = false;
     try {
       stopRequested = await deps.hasStopFile();
@@ -672,12 +999,87 @@ export async function handleSessionIdle(
       // Fail closed: a filesystem error must not silently ignore STOP_GOAL.
       return { decision: 'stopped', reason: 'stop-check-failed' };
     }
+    // A message id newer than our last continuation means someone else spoke
+    // after the loop parked. This is the same signal the human-message guard
+    // already trusts, reused so the answer to the gate can revive the loop.
+    const humanSpoke =
+      current !== null &&
+      current.lastContinuedMessageId !== '' &&
+      ctx.lastMessageId !== null &&
+      ctx.lastMessageId !== undefined &&
+      ctx.lastMessageId !== current.lastContinuedMessageId;
+    // Score the turn our last continuation started. Without an observation the
+    // streak is never scored, so a host that does not report tool activity can
+    // never park a productive goal by accident.
+    let effective: GoalState | null = current;
+    let score: TurnScore | null =
+      effective === null
+        ? null
+        : scoreContinuationTurn(effective, ctx.lastTurn ?? null);
+    if (
+      effective !== null &&
+      effective.status === 'active' &&
+      effective.idleParked === true &&
+      humanSpoke
+    ) {
+      // The answer arrived: clear the latch once so the loop can run again.
+      const cleared = await unparkOnHumanInput(statePath, effective, deps);
+      if (!cleared.ok) return { decision: 'skipped', reason: 'lease-held' };
+      if (cleared.state !== null) {
+        effective = cleared.state;
+        score = scoreContinuationTurn(effective, ctx.lastTurn ?? null);
+      }
+      now = deps.clock.nowMs();
+    }
+    const budget =
+      effective === null ? null : checkBudget(effective, now, deps.limits);
+    // Idle park: the streak tripped, or the turn asked the human a question.
+    // Budget exhaustion keeps precedence so the wrap-up path stays the owner of
+    // that case, and STOP_GOAL always wins over a notice.
+    const wantsPark =
+      effective !== null &&
+      score !== null &&
+      score.scored &&
+      score.parkRequested &&
+      effective.status === 'active' &&
+      effective.idleParked !== true &&
+      effective.pendingVerification !== true &&
+      effective.wrapupSent !== true &&
+      stopRequested !== true &&
+      (budget === null || budget.ok);
+    if (wantsPark && effective !== null && score !== null) {
+      // One-shot park through the same plumbing as the budget wrap. No status is
+      // invented: the goal stays active, so goal_block is callable right away
+      // and goal_resume is the single-call way back.
+      const parked = score;
+      // Remember which turn this verdict was scored from so the replayed
+      // observation cannot fire a second park after a human answer.
+      const scoredTurnId =
+        typeof ctx.lastTurn?.turnId === 'string' ? ctx.lastTurn.turnId : '';
+      return sendOneShotStop({
+        statePath,
+        state: effective,
+        deps,
+        prompt: buildIdleParkPrompt(
+          effective,
+          parked.noProgressTurns,
+          parked.questionAsked,
+        ),
+        successReason: 'idle-awaiting-input',
+        mark: (s: GoalState): GoalState => ({
+          ...s,
+          idleParked: true,
+          noProgressTurns: parked.noProgressTurns,
+          lastScoredTurnId: scoredTurnId,
+        }),
+      });
+    }
     const gate = shouldContinue(
-      current,
+      effective,
       now,
       ctx.lastMessageId ?? null,
       deps.limits,
-      { stopRequested },
+      { stopRequested, humanSpoke },
     );
     if (!gate.ok) {
       // No-goal and finished goals stop the loop; cooldown and contention only skip one tick.
@@ -687,88 +1089,23 @@ export async function handleSessionIdle(
         gate.reason === 'max-turns' ||
         gate.reason === 'wall-time' ||
         gate.reason === 'wrapped-up' ||
-        gate.reason === 'stop-file';
+        gate.reason === 'stop-file' ||
+        gate.reason === 'idle-awaiting-input';
       // Wrap-up-once: on the first budget hit send one final wrap prompt, mark
       // the persisted flag, then every later hit stops without another send.
       if (
         (gate.reason === 'max-turns' || gate.reason === 'wall-time') &&
-        current !== null &&
-        (current as GoalState).wrapupSent !== true
+        effective !== null &&
+        effective.wrapupSent !== true
       ) {
-        const cur = current as GoalState;
-        // Claim the lease so the wrap send stays single-flight like any turn.
-        let wrapClaimed: { claimed: boolean; state: GoalState | null } | null =
-          null;
-        try {
-          wrapClaimed = await deps.tryClaim(
-            statePath,
-            deps.ownerId,
-            LEASE_TTL_MS,
-            deps.clock,
-          );
-        } catch {
-          wrapClaimed = null;
-        }
-        // Lease not held: skip this tick without flipping the flag so the wrap
-        // can still be sent later. A lost lease must not consume the one wrap.
-        if (wrapClaimed === null || !wrapClaimed.claimed) {
-          return { decision: 'skipped', reason: 'lease-held' };
-        }
-        let wrapOk = false;
-        try {
-          const raw = await deps.sendPrompt(
-            buildWrapupPrompt(cur, gate.reason),
-          );
-          wrapOk = normalizeSendResult(raw).success;
-        } catch {
-          // A thrown wrap send is a failure: do not flip the flag.
-          wrapOk = false;
-        }
-        // Only a real successful wrap marks the goal wrapped.
-        if (wrapOk) {
-          try {
-            await deps.saveState(statePath, {
-              ...cur,
-              wrapupSent: true,
-              leaseOwner: null,
-              leaseExpiresAtMs: 0,
-              updatedAtMs: now,
-            });
-          } catch {
-            // Bookkeeping failure never changes the terminal verdict.
-          }
-          // A completed wrap clears any watchdog: the goal is terminal.
-          try {
-            deps.onTurnSettled?.({ ok: true, deadlineMs: null });
-          } catch {
-            // Settle hook is best-effort.
-          }
-          return { decision: 'stopped', reason: gate.reason };
-        }
-        // Send failed: record a retry attempt and stop without flipping.
-        const wrapPending = buildPendingAttempt(cur, 'provider-error', now);
-        try {
-          await deps.saveState(statePath, {
-            ...cur,
-            pendingAttempt: wrapPending,
-            failureCount: cur.failureCount + 1,
-            leaseOwner: null,
-            leaseExpiresAtMs: 0,
-            updatedAtMs: now,
-          });
-        } catch {
-          // Cleanup failure keeps the send failure as the reported reason.
-        }
-        // A failed wrap re-arms the watchdog so the wrap can be retried.
-        try {
-          deps.onTurnSettled?.({
-            ok: false,
-            deadlineMs: wrapPending.deadlineMs,
-          });
-        } catch {
-          // Settle hook is best-effort.
-        }
-        return { decision: 'stopped', reason: 'send-failed' };
+        return sendOneShotStop({
+          statePath,
+          state: effective,
+          deps,
+          prompt: buildWrapupPrompt(effective, gate.reason),
+          successReason: gate.reason,
+          mark: (s: GoalState): GoalState => ({ ...s, wrapupSent: true }),
+        });
       }
       return {
         decision: terminal ? 'stopped' : 'skipped',
@@ -832,7 +1169,7 @@ export async function handleSessionIdle(
     }
     // Post-send timestamp: slow sends must not shorten the real cooldown.
     const afterSend = deps.clock.nowMs();
-    const next: GoalState = {
+    const base: GoalState = {
       ...claimed.state,
       iterationCount: claimed.state.iterationCount + 1,
       lastTurnAtMs: afterSend,
@@ -845,8 +1182,28 @@ export async function handleSessionIdle(
       failureCount: 0,
       // Remember the real session so a restart can rearm the right lane.
       lastSessionId: sessionPart,
+      // A send means the loop is running again, and the streak stored here is
+      // the score of the turn that just ended (0 after a productive turn).
+      noProgressTurns:
+        score !== null && score.scored
+          ? score.noProgressTurns
+          : claimed.state.noProgressTurns,
+      idleParked: false,
       leaseOwner: null,
       leaseExpiresAtMs: 0,
+    };
+    // Stamp the saved shape, not the pre-save one: the loop's own increment must
+    // never look like a foreign mutation on the next tick. The scored turn id
+    // records that this observation was consumed, so a replay cannot count twice.
+    const next: GoalState = {
+      ...base,
+      lastTurnKey: progressKey(base),
+      lastScoredTurnId:
+        score !== null &&
+        score.scored &&
+        typeof ctx.lastTurn?.turnId === 'string'
+          ? ctx.lastTurn.turnId
+          : claimed.state.lastScoredTurnId,
     };
     try {
       await deps.saveState(statePath, next);
@@ -858,6 +1215,12 @@ export async function handleSessionIdle(
       recordPerSessionTick(tokenKey, afterSend);
     } catch {
       // Cooldown bookkeeping never blocks a successful send.
+    }
+    // Tell the wiring which turn identity to watch for progress signals.
+    try {
+      deps.onContinuationSent?.(sent.messageId);
+    } catch {
+      // Observation bookkeeping is best-effort; the loop still sent its turn.
     }
     // A successful turn clears any watchdog: no stale wake should fire.
     try {

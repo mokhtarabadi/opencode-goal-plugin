@@ -881,3 +881,47 @@ describe('goal_set clears stale evidence', () => {
     expect(done.content).toBe('Goal marked complete.');
   });
 });
+
+describe('evidence after completion names the remedy', () => {
+  it('recording against a completed goal says call goal_set first', async () => {
+    // The observed dead end: after a completion the agent retried the same
+    // evidence call, and the bare status report gave it no way forward.
+    const { writeFileSync } = await import('node:fs');
+    const dir = mkdtempSync(path.join(tmpdir(), 'goal-tools-remedy-'));
+    writeFileSync(path.join(dir, 'proof.txt'), 'done\n');
+    const defs: CapturedDef[] = [];
+    await registerGoalTools(fakeCtx(defs), dir, new FakeClock());
+    const byName = (name: string): CapturedDef => {
+      const found = defs.find((d) => d.name === name);
+      if (!found) throw new Error('missing tool ' + name);
+      return found;
+    };
+    const session = { sessionID: 'sess-remedy' };
+    await byName('goal_set').execute({ title: 'done already' }, session);
+    await byName('goal_evidence').execute(
+      {
+        id: 'e1',
+        claim: 'proof',
+        files: ['proof.txt'],
+        tests: [{ command: 'node -e "process.exit(0)"', exitCode: 0 }],
+      },
+      session,
+    );
+    expect((await byName('goal_complete').execute({}, session)).content).toBe(
+      'Goal marked complete.',
+    );
+    const late = await byName('goal_evidence').execute(
+      {
+        id: 'e2',
+        claim: 'late proof',
+        files: ['proof.txt'],
+        tests: [{ command: 'node -e "process.exit(0)"', exitCode: 0 }],
+      },
+      session,
+    );
+    // Pinned wording: the exact dead end must name goal_set as the remedy.
+    expect(late.content).toBe(
+      'Only an active goal can record evidence. Current status: complete. Call goal_set first to start a new goal.',
+    );
+  });
+});

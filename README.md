@@ -1,6 +1,6 @@
 # opencode-goal-plugin
 
-Slash goal sets one objective and the agent keeps working until it is complete, blocked, or cleared. File state survives compaction. Idle auto-continue sends one prompt per idle tick while the goal stays active and within limits.
+Slash goal sets one objective and the agent keeps working until it is complete, blocked, or cleared. File state survives compaction. Idle auto-continue sends one prompt per idle tick while the goal stays active and within limits. Two consecutive turns that make no tool call and change no goal state park the loop with one message naming `goal_block <reason>` and `goal_resume`; a `question` tool parks the next tick immediately.
 
 ## Install
 
@@ -37,6 +37,6 @@ Same server-only core runs on web, CLI, TUI, and server-only: no TUI imports, no
 /goal &lt;objective&gt; | /goal status | /goal block &lt;reason&gt; | /goal complete | /goal resume | /goal clear
 Agent tools (no slash needed, same guarded lane): `goal_set`, `goal_block`, `goal_complete`, `goal_resume`.
 Kill switch: create `.opencode/STOP_GOAL` to stop the loop immediately.
-Completion: `/goal complete` needs evidence in the session evidence sidecar (`.opencode/goals/<session-id>.evidence.json`) with file citations plus passing test proof. The recorded test command is executed at completion time, so a declared exit code alone cannot pass the gate, and a blocked completion quotes the verifier's failures so the cause is visible; a test entry may carry an `env` map to pin a toolchain. Compaction-safe: state reloads from file and resumes without double send.
+Completion: `/goal complete` needs evidence in the session evidence sidecar (`.opencode/goals/<session-id>.evidence.json`) with file citations plus passing test proof. A citation that legitimately moved inside the project (a Kanban lane promotion, a rename) still proves: the verifier tries the exact path first, then a unique basename hit, and reports which path answered it; two same-named files fail as `ambiguous-citation` naming both, and a citation with no match at all stays `missing-file`. The recorded test command is executed at completion time, so a declared exit code alone cannot pass the gate, and a blocked completion quotes the verifier's failures so the cause is visible; a test entry may carry an `env` map to pin a toolchain. Compaction-safe: state reloads from file and resumes without double send.
 State: `.opencode/goals/<session-id>.json` with UTC epoch ms, one file per session. A legacy `.opencode/goal-state.json` is still read as a fallback and migrates on the next write.
 Build: npm run typecheck, npm test, npm run compile.

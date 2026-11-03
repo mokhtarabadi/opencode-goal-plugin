@@ -356,6 +356,21 @@ async function toolBlock(
 }
 
 /**
+ * Message for recording evidence against a goal that is not active.
+ * Why it names goal_set: after a completion the sidecar is closed for writes,
+ * and the bare status report left the agent with no next step — it retried the
+ * same call. The remedy is one call away, so the message says so.
+ * @param status current goal status, e.g. `complete`
+ */
+function inactiveGoalEvidenceMessage(status: string): string {
+  return (
+    'Only an active goal can record evidence. Current status: ' +
+    status +
+    '. Call goal_set first to start a new goal.'
+  );
+}
+
+/**
  * Record one evidence criterion for the active goal.
  * Why this function is exported: the slash lane calls it directly so both
  * lanes share one write path with identical validation — parity by construction.
@@ -477,11 +492,7 @@ export async function recordEvidence(
     return 'No goal set. Use /goal <objective> first.';
   }
   if (loaded.state.status !== 'active') {
-    return (
-      'Only an active goal can record evidence. Current status: ' +
-      loaded.state.status +
-      '.'
-    );
+    return inactiveGoalEvidenceMessage(loaded.state.status);
   }
   const owner = toolOwner(sessionID);
   const claimRes = await claimForTool(
@@ -501,11 +512,7 @@ export async function recordEvidence(
       return 'No goal set. Use /goal <objective> first.';
     }
     if (fresh.state.status !== 'active') {
-      return (
-        'Only an active goal can record evidence. Current status: ' +
-        fresh.state.status +
-        '.'
-      );
+      return inactiveGoalEvidenceMessage(fresh.state.status);
     }
     // Null sidecar (e.g. tool-lane set never seeded one) starts empty.
     // Scoped evidence: slash plus tool lanes never share citations.

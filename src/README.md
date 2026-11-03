@@ -14,11 +14,11 @@ module is pure enough to test without an OpenCode host.
 | `state.ts`      | `GoalState` shape, per-session path resolution, atomic save, claim lock and lease                               |
 | `goal.ts`       | Slash parsing, JSON Schemas, lifecycle transitions, title traversal guard                                       |
 | `tools.ts`      | The five agent tools and the lease-guarded mutation paths                                                       |
-| `loop.ts`       | One idle tick: gate, claim, send, record; failure classification                                                |
+| `loop.ts`       | One idle tick: gate, claim, send, record; failure classification; human-gate park                               |
 | `watchdog.ts`   | In-memory timers that wake a stalled lane from persisted state                                                  |
 | `compaction.ts` | Snapshot before compaction, restore after, abort-set pruning                                                    |
 | `evidence.ts`   | Evidence sidecar shape, per-session paths, atomic save                                                          |
-| `verifier.ts`   | Completion gate: citations, then declared or observed test proof                                                |
+| `verifier.ts`   | Completion gate: citations (exact, then unique basename), then declared or observed test proof                  |
 | `proof.ts`      | Executes a recorded proof command under timeout, output cap and cwd pin                                         |
 | `limits.ts`     | Turn, wall-time, delay and per-session cooldown budgets                                                         |
 
@@ -48,11 +48,23 @@ module is pure enough to test without an OpenCode host.
    must stay empty instead of merging the old bucket back in.
 9. Nothing in `src/` throws into the host: host callbacks map failures to a
    reason string.
+10. The idle park never invents a status. A goal parked on a human gate stays
+    `active`; only the auto-continue loop pauses, so `goal_block` works at once
+    and `goal_resume` (or `goal_set`) turns the loop back on. The latch is set
+    only from a turn observation the wiring actually saw, so a host that does not
+    report tool activity can never park a productive goal.
+11. A rejected completion never silently picks between two same-named files, and
+    a citation that resolves by basename is always reported: ambiguity fails as
+    `ambiguous-citation` naming the candidates, and no match stays `missing-file`.
 
 ## Risks
 
 - `loop.ts` and `index.ts` both own idle wiring; a second sender would allow a
   double turn, so both use one `buildIdleDeps`.
+- The park decision is only as good as the tool-event stream. `index.ts` sets the
+  observation from `session.tool.input.started` / `session.tool.called` and
+  withholds it until the lane has reported at least one tool event; a host that
+  renames those events disarms the park instead of parking wrongly.
 - `proof.ts` executes the recorded command with `cwd` set to the project
   directory. That is a starting directory, not a sandbox: a command that changes
   directory can leave it. The bounds are the timeout, the output cap, the command

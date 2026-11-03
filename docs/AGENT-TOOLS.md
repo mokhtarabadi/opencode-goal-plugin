@@ -66,6 +66,15 @@ Goal marked blocked: Waiting on the payments API credentials
 A blocked goal stops the auto-continue loop. Nothing resumes it except
 `goal_resume` or the human.
 
+### When the loop parks itself
+
+Two consecutive auto-continue turns that invoke no tool and change no goal state
+park the loop automatically: it posts one `Goal idle awaiting input` message
+naming `goal_block <reason>` and `goal_resume`, then stops. A turn that uses the
+`question` tool parks the next tick immediately. If you are waiting on a human,
+`goal_block` is the explicit way to say so — the parked loop stays `active`, so
+the call works right away and `goal_resume` brings it back after the answer.
+
 ## Tool 3 — goal_complete
 
 Close the goal when the work is done. This tool has a gate: it succeeds

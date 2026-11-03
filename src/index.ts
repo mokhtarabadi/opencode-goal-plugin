@@ -36,6 +36,7 @@ import {
   handleSessionIdle,
   handleSessionFailure,
   classifyFailure,
+  observeToolCall,
 } from './loop.js';
 import { DEFAULT_LIMITS, STOP_FILE_NAME } from './limits.js';
 import type { Limits } from './limits.js';
@@ -928,6 +929,26 @@ export default Plugin.define({
     const controller = new AbortController();
     const idleAbortControllers = new Set<AbortController>();
     idleAbortControllers.add(controller);
+    /**
+     * Per-lane observation of the turn the last continuation started.
+     * Why this map exists: the pure loop cannot see the event stream, so the
+     * wiring records whether that turn invoked a tool and whether it asked the
+     * human a question, then hands it to the next idle tick. Keyed by session
+     * lane because two sessions must never share one judgement.
+     */
+    const turnObservations = new Map<
+      string,
+      { turnId: string; usedTool: boolean; askedQuestion: boolean }
+    >();
+    /**
+     * Per-lane count of tool events seen since setup.
+     * Why this exists: a host that never reports tool activity cannot tell a
+     * silent turn from a busy one, so the idle park stays disarmed there. That
+     * is the fail-safe direction — never park a goal the loop cannot judge.
+     */
+    const toolEventsSeen = new Map<string, number>();
+    /** Cap for both tracking maps so a long-lived host cannot grow unbounded. */
+    const OBSERVATION_LIMIT = 500;
     // Shared deps builder so idle ticks, failure rearms, and startup resume all
     // use one sender. Why one builder: a second copy could drift and let a wake
     // or a retry send twice under the same lane.
@@ -991,6 +1012,26 @@ export default Plugin.define({
           }
         },
         hasStopFile,
+        // Start watching a new assistant turn: the continuation message id is
+        // its identity, so a replayed observation can never be scored twice.
+        onContinuationSent: (messageId: string) => {
+          try {
+            if (
+              turnObservations.size > OBSERVATION_LIMIT &&
+              !turnObservations.has(rawID)
+            ) {
+              const oldest = turnObservations.keys().next();
+              if (!oldest.done) turnObservations.delete(oldest.value);
+            }
+            turnObservations.set(rawID, {
+              turnId: messageId,
+              usedTool: false,
+              askedQuestion: false,
+            });
+          } catch {
+            // Observation bookkeeping is best-effort; the turn already sent.
+          }
+        },
         // Settle hook: success clears the watchdog, failure re-arms it.
         onTurnSettled: (r: { ok: boolean; deadlineMs: number | null }) => {
           try {
@@ -1023,14 +1064,16 @@ export default Plugin.define({
           signal: controller.signal,
         }) as AsyncIterable<{
           type?: unknown;
-          data?: { sessionID?: unknown };
+          data?: { sessionID?: unknown; name?: unknown };
           properties?: { sessionID?: unknown };
         }>;
         for await (const event of stream) {
           try {
             if (event === null || typeof event !== 'object') continue;
             const evType = (event as { type?: unknown }).type;
-            const data = (event as { data?: { sessionID?: unknown } }).data;
+            const data = (
+              event as { data?: { sessionID?: unknown; name?: unknown } }
+            ).data;
             const props = (event as { properties?: { sessionID?: unknown } })
               .properties;
             // Failure events (error / execution.failed / execution.interrupted)
@@ -1079,6 +1122,37 @@ export default Plugin.define({
                 .catch(() => undefined);
               continue;
             }
+            // Tool events are the only agent-side progress signal the loop can
+            // see: record the invocation for the lane's current turn. The tool
+            // name lives on input.started, and `question` is the explicit
+            // human-gate hint the idle park honours on the next tick.
+            if (
+              evType === 'session.tool.input.started' ||
+              evType === 'session.tool.called'
+            ) {
+              const toolID = data?.sessionID ?? props?.sessionID;
+              if (typeof toolID !== 'string' || toolID.length === 0) continue;
+              if (
+                toolEventsSeen.size > OBSERVATION_LIMIT &&
+                !toolEventsSeen.has(toolID)
+              ) {
+                const oldest = toolEventsSeen.keys().next();
+                if (!oldest.done) toolEventsSeen.delete(oldest.value);
+              }
+              toolEventsSeen.set(toolID, (toolEventsSeen.get(toolID) ?? 0) + 1);
+              const turn = turnObservations.get(toolID);
+              if (turn !== undefined) {
+                // `question` is the explicit human gate; any other tool is
+                // ordinary progress. The rule lives in the pure loop module.
+                const toolName =
+                  typeof data?.name === 'string' ? data.name : null;
+                turnObservations.set(
+                  toolID,
+                  observeToolCall(turn, toolName) ?? turn,
+                );
+              }
+              continue;
+            }
             if (evType !== 'session.idle') continue;
             const rawID = data?.sessionID ?? props?.sessionID;
             if (typeof rawID !== 'string' || rawID.length === 0) continue;
@@ -1095,6 +1169,13 @@ export default Plugin.define({
                 projectDir,
                 lastMessageId: typeof lastMsgId === 'string' ? lastMsgId : null,
                 sessionId: rawID,
+                // Hand over the observation only once the host has proven it
+                // reports tool activity: a silent host must never park a goal
+                // by looking idle when the loop simply cannot see its work.
+                lastTurn:
+                  (toolEventsSeen.get(rawID) ?? 0) > 0
+                    ? (turnObservations.get(rawID) ?? null)
+                    : null,
               },
               buildIdleDeps(rawID),
             );

@@ -88,6 +88,35 @@ export interface GoalState {
    * Empty means unknown, so no watchdog is armed until a real event arrives.
    */
   lastSessionId: string;
+  /**
+   * Consecutive auto-continue turns that ended with no tool invocation and no
+   * goal state change. Why this field exists: a loop that keeps sending
+   * continuations while the agent waits on a human burns the entire turn budget
+   * restating the same status. Reset to zero by any productive turn.
+   */
+  noProgressTurns: number;
+  /**
+   * Loop-level park latch for a human gate.
+   * Why not a status: the goal is still live work, so no lifecycle value is
+   * invented — only the auto-continue loop pauses, and the existing verbs
+   * (`goal_block`, `goal_resume`, `goal_set`) stay callable.
+   */
+  idleParked: boolean;
+  /**
+   * Progress stamp of the state exactly as the loop last saved it.
+   * Why this field exists: every other writer (a goal tool, a slash command, a
+   * failure park) changes one of the stamped fields, so a mismatch proves the
+   * continuation turn mutated the goal even when it made no tool call.
+   */
+  lastTurnKey: string;
+  /**
+   * Continuation message id of the last turn already folded into the streak.
+   * Why this field exists: an observation is replayed by the host until the next
+   * continuation is sent, and a parked goal sends none. Without this marker the
+   * stale observation would re-park the goal in the very tick that a human
+   * answer cleared the latch.
+   */
+  lastScoredTurnId: string;
 }
 
 export const STATE_FILENAME = 'goal-state.json';
@@ -239,6 +268,10 @@ export function initialState(
     failureCount: 0,
     recoveryEpoch: 0,
     lastSessionId: '',
+    noProgressTurns: 0,
+    idleParked: false,
+    lastTurnKey: '',
+    lastScoredTurnId: '',
   };
 }
 
@@ -331,6 +364,13 @@ function isValidState(value: unknown): value is GoalState {
     return false;
   if ('lastSessionId' in v && typeof v['lastSessionId'] !== 'string')
     return false;
+  // Idle-park fields stay optional so older files load, then normalize fills them.
+  if ('noProgressTurns' in v && typeof v['noProgressTurns'] !== 'number')
+    return false;
+  if ('idleParked' in v && typeof v['idleParked'] !== 'boolean') return false;
+  if ('lastTurnKey' in v && typeof v['lastTurnKey'] !== 'string') return false;
+  if ('lastScoredTurnId' in v && typeof v['lastScoredTurnId'] !== 'string')
+    return false;
   return true;
 }
 
@@ -378,6 +418,26 @@ export function normalizeState(input: GoalState): GoalState {
       'string'
         ? ((input as unknown as { lastSessionId: string })
             .lastSessionId as string)
+        : '',
+    noProgressTurns:
+      typeof (input as unknown as { noProgressTurns?: unknown })
+        .noProgressTurns === 'number'
+        ? ((input as unknown as { noProgressTurns: number })
+            .noProgressTurns as number)
+        : 0,
+    // Loose boolean check: a numeric 0 would otherwise arm the latch wrongly.
+    idleParked:
+      (input as unknown as { idleParked?: unknown }).idleParked === true,
+    lastTurnKey:
+      typeof (input as unknown as { lastTurnKey?: unknown }).lastTurnKey ===
+      'string'
+        ? ((input as unknown as { lastTurnKey: string }).lastTurnKey as string)
+        : '',
+    lastScoredTurnId:
+      typeof (input as unknown as { lastScoredTurnId?: unknown })
+        .lastScoredTurnId === 'string'
+        ? ((input as unknown as { lastScoredTurnId: string })
+            .lastScoredTurnId as string)
         : '',
   };
 }
