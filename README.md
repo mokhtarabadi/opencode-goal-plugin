@@ -1,6 +1,6 @@
 # opencode-goal-plugin
 
-Slash goal sets one objective and the agent keeps working until it is complete, blocked, or cleared. File state survives compaction. Idle auto-continue sends one prompt per idle tick while the goal stays active and within limits. Two consecutive turns that make no tool call and change no goal state park the loop with one message naming `goal_block <reason>` and `goal_resume`; a `question` tool parks the next tick immediately.
+Slash goal sets one objective and the agent keeps working until it is complete, blocked, or cleared. File state survives compaction. Idle auto-continue sends one prompt per idle tick while the goal stays active and within limits. A new objective is a new goal generation: `/goal <objective>` restarts the turn and wall budgets, while `/goal resume` continues the same one. When a goal finishes, the loop stays quiet until the next objective is set — it never invents one. Two consecutive turns that make no tool call and change no goal state park the loop with one message naming `goal_block <reason>` and `goal_resume`; a `question` tool parks the next tick immediately.
 
 ## Install
 

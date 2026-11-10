@@ -56,6 +56,11 @@ module is pure enough to test without an OpenCode host.
 11. A rejected completion never silently picks between two same-named files, and
     a citation that resolves by basename is always reported: ambiguity fails as
     `ambiguous-citation` naming the candidates, and no match stays `missing-file`.
+12. A new objective is a new goal generation: `setObjective` starts both budgets
+    at that moment (`createdAtMs` is not inherited), so a goal set hours into a
+    long session is not born over budget. A one-shot stop (budget wrap or idle
+    park) writes from the claim snapshot, never from the state loaded before the
+    claim, so a `goal_set` that lands in that window is not overwritten.
 
 ## Risks
 

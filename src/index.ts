@@ -70,7 +70,7 @@ import {
  */
 
 export const PLUGIN_NAME = 'opencode-goal-plugin';
-export const PLUGIN_VERSION = '0.2.0';
+export const PLUGIN_VERSION = '0.2.1';
 
 /**
  * Message when the state lease is already held by another lane.
@@ -1109,7 +1109,11 @@ export default Plugin.define({
               );
               // Re-arm the watchdog from the persisted attempt so a retryable
               // provider error wakes the loop even when no idle event follows.
-              void loadGoalState(resolveStatePath(projectDir))
+              // The state lives on the failing session's scoped path, not the
+              // legacy file: reading legacy here left the watchdog unarmed for
+              // every per-session lane (ADR-007's whole purpose) and could arm
+              // another session's legacy goal inside this lane.
+              void loadGoalState(resolveStatePath(projectDir, failID))
                 .then((st) => {
                   if (st === null) return;
                   rearmFromState(projectDir, failID, st, clock, async () => {

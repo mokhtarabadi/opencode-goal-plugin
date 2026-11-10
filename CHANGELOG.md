@@ -46,6 +46,11 @@ All notable changes follow Keep a Changelog.
 - Hotfix2 afterSend Clock plus Set copy plus prune helper plus drive-relative guard.
 - Tool-lane `goal_set` now seeds a fresh evidence sidecar like `/goal <objective>`, so criteria recorded for a finished goal no longer accumulate and block later completions with `evidence-invalid`; regression tests cover the stale-criteria path, the old failing command, and slash/tool parity.
 - Evidence reads stop falling back to the pre-isolation sidecar once the session has its own file, because an empty seeded file used to parse as absent and merge the legacy bucket back in; a session with no scoped file still migrates once.
+- A new objective now restarts both budget clocks: `setObjective` no longer inherits `createdAtMs` from the previous goal, so a goal set hours into a long session is no longer over the wall budget on arrival (one wrap-up, then `wrapped-up` forever). `resume` still continues the same generation, so it never refreshes a budget.
+- A one-shot stop (budget wrap or idle park) now bases its write on the claim snapshot: if a `goal_set` landed between the tick's load and the claim, the tick drops its verdict (`state-changed`), sends nothing and releases the lease instead of overwriting the new objective with the old one plus the stop latch. A failed stop send records its retry against the same fresh snapshot.
+- A provider error now rearms the watchdog from the failing session's scoped state file instead of the legacy path, so the recovery ADR-007 added actually arms for per-session lanes (and can no longer arm another session's legacy goal inside the failing lane).
+- Docs: `GoalState` now says plainly that `iterationCount`/`tokenSpend` are loop-only counters (zeros are normal when no continuation ran) and that `wallTimeMs` is reserved telemetry no lane advances, so a zero must never be read as "no time spent"; `recordTurnResult` is marked deprecated and unwired.
+- Version: package plus `PLUGIN_VERSION` 0.2.1 for this behaviour fix; the 0.3.0 publish gate noted above is unaffected.
 
 ## [0.3.0] - 2026-10-16
 

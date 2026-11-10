@@ -47,11 +47,27 @@ export interface PendingAttempt {
 export interface GoalState {
   objective: string;
   status: GoalStatus;
+  /**
+   * Auto-continue accounting, written by the idle loop only.
+   * Why zeros are normal: `iterationCount` counts continuation sends and
+   * `tokenSpend` adds what the host reports for one send, so a goal set and
+   * finished by the agent's own turns (no idle continuation) legitimately keeps
+   * both at zero. They are not live usage counters for the whole session.
+   */
   iterationCount: number;
   tokenSpend: number;
+  /**
+   * Reserved wall-clock telemetry, kept on disk for forward compatibility.
+   * Why a reader must not trust it: no lane advances this field today — the wall
+   * budget is measured as `now - createdAtMs` in `limits.ts` — so a zero here
+   * means "not measured", never "the goal took no time".
+   */
   wallTimeMs: number;
   leaseOwner: string | null;
   leaseExpiresAtMs: number;
+  /** Last notable note about the current goal generation (a block reason or a
+   * recorded turn summary). Reset by `setObjective`, so it can never describe a
+   * previous objective, and kept after completion as that goal's final note. */
   lastSummary: string;
   createdAtMs: number;
   updatedAtMs: number;

@@ -339,8 +339,12 @@ export function isSafeGoalTitle(title: string): boolean {
 }
 
 /**
- * Set a new objective, resetting counters and clearing lease.
- * @param prev previous state or null for first run
+ * Set a new objective, resetting counters and clearing the lease.
+ * Why prev stays in the signature: both set lanes pass the state they loaded, so
+ * a caller never has to remember to strip fields. A new objective is a new goal
+ * generation, so nothing is inherited: the turn budget and the wall budget both
+ * restart at this moment.
+ * @param prev previous state or null for first run (accepted, never inherited)
  * @param objective new objective text
  * @param clock injected clock
  * @param hostVersion host version for audit
@@ -351,13 +355,13 @@ export function setObjective(
   clock: Clock,
   hostVersion: string,
 ): GoalState {
-  // Fresh state keeps history simple for Phase 1, counters restart per objective.
-  const fresh = initialState(objective, clock, hostVersion);
-  if (prev !== null) {
-    // Preserve creation time of first goal in this chain for wall-time budgets later.
-    return { ...fresh, createdAtMs: prev.createdAtMs };
-  }
-  return fresh;
+  // Fresh state keeps history simple, counters restart per objective. Inheriting
+  // createdAtMs from the previous goal (the old behavior) made a goal set more
+  // than maxWallMs into a long session over budget on arrival: checkBudget
+  // measures wall time from createdAtMs, so the loop sent one wrap-up and never
+  // auto-continued that brand-new goal. The wall budget is per goal.
+  void prev;
+  return initialState(objective, clock, hostVersion);
 }
 
 /**

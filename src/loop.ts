@@ -667,6 +667,25 @@ async function sendOneShotStop(args: {
   if (claimed === null || !claimed.claimed) {
     return { decision: 'skipped', reason: 'lease-held' };
   }
+  // The claim snapshot is the only fresh truth. A goal_set or a resume that
+  // landed between the tick's load and this claim must never be overwritten by
+  // the stale verdict: that would resurrect the old objective and stamp the stop
+  // latch on it. Drop the verdict and leave the newer state alone instead.
+  const fresh = claimed.state ?? state;
+  if (fresh.objective !== state.objective || fresh.status !== 'active') {
+    try {
+      // Release the lease this claim took; the goal itself stays untouched.
+      await deps.saveState(statePath, {
+        ...fresh,
+        leaseOwner: null,
+        leaseExpiresAtMs: 0,
+        updatedAtMs: deps.clock.nowMs(),
+      });
+    } catch {
+      // TTL reclaims the lease: a failed release never touches the goal.
+    }
+    return { decision: 'skipped', reason: 'state-changed' };
+  }
   const now = deps.clock.nowMs();
   let sentOk = false;
   try {
@@ -678,7 +697,7 @@ async function sendOneShotStop(args: {
   if (sentOk) {
     try {
       await deps.saveState(statePath, {
-        ...mark(state),
+        ...mark(fresh),
         leaseOwner: null,
         leaseExpiresAtMs: 0,
         updatedAtMs: now,
@@ -695,12 +714,12 @@ async function sendOneShotStop(args: {
     return { decision: 'stopped', reason: successReason };
   }
   // Send failed: record a retry attempt and stop without flipping the latch.
-  const pending = buildPendingAttempt(state, 'provider-error', now);
+  const pending = buildPendingAttempt(fresh, 'provider-error', now);
   try {
     await deps.saveState(statePath, {
-      ...state,
+      ...fresh,
       pendingAttempt: pending,
-      failureCount: state.failureCount + 1,
+      failureCount: fresh.failureCount + 1,
       leaseOwner: null,
       leaseExpiresAtMs: 0,
       updatedAtMs: now,
@@ -857,6 +876,9 @@ export function buildContinuationPrompt(state: GoalState): string {
 
 /**
  * Apply a finished turn to state.
+ * @deprecated No lane calls this: `handleSessionIdle` owns turn accounting and
+ * increments on a successful continuation send, so `wallTimeMs` (which only this
+ * helper advanced) stays at zero by design. Kept as a pure helper, not wired.
  * @param state current state
  * @param result message id plus optional spend plus elapsed plus summary
  * @param clock injected clock

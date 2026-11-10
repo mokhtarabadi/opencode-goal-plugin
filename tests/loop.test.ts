@@ -409,4 +409,43 @@ describe('handleSessionIdle hardening', () => {
     expect(out.registered).toBe(true);
     expect(typeof cb).toBe('function');
   });
+  it('a one-shot stop never overwrites a goal replaced before the claim', async () => {
+    // Regression: the budget wrap and the idle park wrote the state they loaded
+    // before claiming the lease. A goal_set that landed in that window was
+    // overwritten by the stale snapshot, so the new objective vanished and the
+    // old one came back carrying the stop latch. The claim snapshot is the truth.
+    const c = new FakeClock(1700000000000);
+    const maxed = makeActive(c, { iterationCount: 30 });
+    const replaced = makeActive(c, {
+      objective: 'newer goal',
+      iterationCount: 0,
+    });
+    const store = { state: maxed as GoalState | null };
+    const saved: GoalState[] = [];
+    const sent: string[] = [];
+    const deps = makeDeps(store, c, sent, {
+      tryClaim: async (_p, owner, ttl, clk) => ({
+        claimed: true,
+        state: {
+          ...replaced,
+          leaseOwner: owner,
+          leaseExpiresAtMs: clk.nowMs() + ttl,
+        },
+      }),
+      saveState: async (_p, s) => {
+        saved.push(s);
+      },
+    });
+    const got = await handleSessionIdle(
+      { projectDir: '/tmp/sc1', lastMessageId: null },
+      deps,
+    );
+    expect(got.decision).toBe('skipped');
+    expect(got.reason).toBe('state-changed');
+    expect(sent.length).toBe(0);
+    const last = saved[saved.length - 1];
+    expect(last?.objective).toBe('newer goal');
+    expect(last?.wrapupSent).toBe(false);
+    expect(last?.leaseOwner).toBeNull();
+  });
 });
