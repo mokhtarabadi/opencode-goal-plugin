@@ -1,9 +1,10 @@
 # Task 17: Audit the goal plugin against one long session, and fix the three defects it proves
 
-**File:** `tasks/qa/17-goal-plugin-audit-and-patch.md`
+**File:** `tasks/completed/17-goal-plugin-audit-and-patch.md`
 **Source:** manager (2026-11-10, after a session where a goal was completed at 07:10 and roughly four hours of later objectives ran with no goal set at all, while the persisted session state showed every counter at zero)
 **Type:** bugfix
-**Status:** qa
+**Status:** closed
+**Finished:** 2026-11-10T11:53:22Z
 **Project:** /home/mohammad/Develop/Projects/opencode-goal-plugin
 **Host:** opencode v2.0.29
 
@@ -171,24 +172,5 @@ run 5: Test Files 1 passed (1)  Tests 3 passed (3)
 ## Factual Git Diff
 
 <!-- BEGIN_GIT_DIFF -->
-
-Not staged and not injected (no `git add`/`commit`/`push` per the audit mandate). Working-tree change set:
-
-```
- CHANGELOG.md           |   5 +++
- DECISIONS.md           |  16 ++++++++
- README.md              |   2 +-
- package.json           |   2 +-
- src/DECISIONS.md       |  36 +++++++++--------
- src/README.md          |   5 +++
- src/goal.ts            |  22 +++++-----
- src/index.ts           |   8 +++-
- src/loop.ts            |  30 ++++++++++++--
- src/state.ts           |  16 ++++++++
- tests/goal.test.ts     |  56 ++++++++++++++++++++++++++
- tests/loop.test.ts     |  39 ++++++++++++++++++
- tests/v2-entry.test.ts | 106 ++++++++++++++++++++++++++++++++++++++++++++++++-
- 13 files changed, 308 insertions(+), 35 deletions(-)
-```
-
+**Factual Git Diff:** Stored in Commit Hash: `9537e79784841b1c6b56170c22a89916fd03890f`
 <!-- END_GIT_DIFF -->
