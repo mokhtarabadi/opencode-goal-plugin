@@ -170,6 +170,42 @@ export function resolveLegacyStatePath(projectDir: string): string {
 }
 
 /**
+ * Resolve the session-state directory for a project.
+ * Why this helper exists: the startup scan and the garbage collector must
+ * agree on one directory, so the layout lives next to `resolveStatePath`
+ * instead of being spelled out at each call site.
+ * @param projectDir project root containing the .opencode dir
+ */
+export function resolveStateDir(projectDir: string): string {
+  // Inline path join keeps the storage layout explicit and testable.
+  return path.join(projectDir, '.opencode', SESSION_STATE_DIR);
+}
+
+/**
+ * Extract the session lane id from a per-session goal file name.
+ * Why this helper exists: the startup rearm scan and the garbage collector
+ * both walk `.opencode/goals/`, and each must classify a file name the same
+ * way. A name that is not a goal file (the evidence sidecar, a claim lock, a
+ * leftover tmp file) yields null, so no caller ever treats it as a lane.
+ * @param fileName bare file name inside the goals dir, no directory part
+ * @returns the lane id, or null when the name is not a goal state file
+ */
+export function goalFileStem(fileName: string): string | null {
+  if (typeof fileName !== 'string' || fileName.length === 0) return null;
+  // Only a plain .json name can be a goal state file.
+  if (!fileName.endsWith('.json')) return null;
+  // The evidence sidecar and the claim lock are siblings, never goal files.
+  if (fileName.endsWith('.evidence.json')) return null;
+  if (fileName.includes('.lock')) return null;
+  // A tmp file from an interrupted atomic write is not a goal file either.
+  if (fileName.includes('.tmp')) return null;
+  const stem = fileName.slice(0, -'.json'.length);
+  // The stem must be a legal lane id: the sanitized form, or its hash.
+  if (!/^[A-Za-z0-9_-]{1,64}$|^sid-[0-9a-f]{8}$/.test(stem)) return null;
+  return stem;
+}
+
+/**
  * Resolve state file path inside project dir, scoped per session when given.
  * Why optional session exists: old callers pass projectDir only and keep the
  * legacy path, so existing tests stay green. New lanes pass the real session

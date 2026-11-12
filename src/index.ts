@@ -60,6 +60,8 @@ import {
   rearmFromState,
   _resetWatchdogsForTests,
 } from './watchdog.js';
+import { collectStaleGoalFiles } from './gc.js';
+import { STALE_GOAL_MAX_AGE_MS } from './limits.js';
 
 /**
  * V2 contract note: file-state at .opencode/goal-state.json owns truth.
@@ -1223,6 +1225,10 @@ export default Plugin.define({
           '.opencode',
           'goals',
         );
+        // GC before rearm: abandoned files from days ago must never re-arm.
+        try {
+          collectStaleGoalFiles(projectDir, clock, { currentSessionId: null });
+        } catch {}
         let names: string[] = [];
         try {
           names = await fsp.readdir(goalsDir);
@@ -1238,6 +1244,24 @@ export default Plugin.define({
             const st = await loadGoalState(resolveStatePath(projectDir, lane));
             if (st === null || st.status !== 'active') continue;
             if (st.pendingAttempt === null) continue;
+            // Guard: a failure episode from days ago re-arms like a fresh one.
+            // Discard stale pending attempts so abandoned goals stop retrying.
+            const lastMs = st.pendingAttempt.lastAttemptMs;
+            const nowMs = clock.nowMs();
+            const age = nowMs - lastMs;
+            const fresh =
+              Number.isFinite(age) && age >= 0 && age <= STALE_GOAL_MAX_AGE_MS;
+            if (!fresh) {
+              try {
+                // Clear stale episode so it never re-arms again.
+                const { saveGoalState } = await import('./state.js');
+                await saveGoalState(resolveStatePath(projectDir, lane), {
+                  ...st,
+                  pendingAttempt: null,
+                });
+              } catch {}
+              continue;
+            }
             rearmFromState(projectDir, lane, st, clock, async () => {
               await handleSessionIdle(
                 { projectDir, lastMessageId: null, sessionId: lane },

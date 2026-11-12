@@ -27,6 +27,17 @@ export const DEFAULT_LIMITS: Limits = {
 export const STOP_FILE_NAME = 'STOP_GOAL';
 
 /**
+ * Maximum age of an abandoned per-session goal file before the garbage
+ * collector reclaims it, and maximum age of a pending attempt before the
+ * startup rearm refuses to resume it.
+ * Why 24h exists: a day is long enough that a goal the operator still wants
+ * (a parked human gate, a session resumed tomorrow) survives, and short
+ * enough that a workspace does not accumulate dozens of dead lanes. One named
+ * constant, so a single edit changes the policy for both paths.
+ */
+export const STALE_GOAL_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+/**
  * Per-session last-tick map for fair cooldown.
  * Why this map exists: global minDelayMs alone throttles all sessions
  * together. Per-session entries keyed by composite projectDir plus sessionId
