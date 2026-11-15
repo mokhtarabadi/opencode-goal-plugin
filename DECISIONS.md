@@ -99,3 +99,11 @@ Context: two writes trusted a snapshot taken before the lease was held. `sendOne
 Decision: `sendOneShotStop` treats the claim snapshot as truth. It compares the fresh objective and status with the state the verdict was built on, and when they differ it drops the verdict without sending, releases the lease, and reports `state-changed` instead of writing the stale snapshot. A failed stop send records its retry against the same fresh snapshot. The failure listener loads `resolveStatePath(projectDir, failID)`, the same path `handleSessionFailure` wrote.
 
 Consequence: a goal replaced mid-tick survives intact, and a provider error rearms the watchdog for the lane that actually failed. Rollback: restore `mark(state)` and the legacy-path load; both are single-line reverts with no state-shape change.
+
+## ADR-019 2026-11-15 Stale goal files are archived and a stale retry never re-arms
+
+Context: per-session files accumulate forever, and the startup scan re-armed any active goal with a non-null pending attempt. A failure from days ago re-armed like one from a minute ago, so abandoned lanes retried forever and woke the idle loop.
+
+Decision: `src/gc.ts` archives per-session files older than `STALE_GOAL_MAX_AGE_MS` (24h, one named constant shared with rearm) out of the scan by rename, never delete, with every collection logged for recovery. The pass never touches the current session, never touches files younger than the threshold, never destroys unreadable files, and never collects an active goal without a known current session or with a live lease. Startup rearm clears a stale pending attempt through the shared `isFreshPendingAttempt` helper instead of arming it. Every lane exit clears its lease, so TTL stays a backstop.
+
+Consequence: dead lanes stop waking the loop while a parked human gate and a resumed session survive, and a wrongly collected goal is recoverable from the archive plus the log. Rollback: remove the GC call plus the freshness guard; prior rearm-everything behavior returns.

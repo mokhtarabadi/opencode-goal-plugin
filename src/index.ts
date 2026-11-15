@@ -60,7 +60,7 @@ import {
   rearmFromState,
   _resetWatchdogsForTests,
 } from './watchdog.js';
-import { collectStaleGoalFiles } from './gc.js';
+import { collectStaleGoalFiles, isFreshPendingAttempt } from './gc.js';
 import { STALE_GOAL_MAX_AGE_MS } from './limits.js';
 
 /**
@@ -1248,9 +1248,11 @@ export default Plugin.define({
             // Discard stale pending attempts so abandoned goals stop retrying.
             const lastMs = st.pendingAttempt.lastAttemptMs;
             const nowMs = clock.nowMs();
-            const age = nowMs - lastMs;
-            const fresh =
-              Number.isFinite(age) && age >= 0 && age <= STALE_GOAL_MAX_AGE_MS;
+            const fresh = isFreshPendingAttempt(
+              lastMs,
+              nowMs,
+              STALE_GOAL_MAX_AGE_MS,
+            );
             if (!fresh) {
               try {
                 // Clear stale episode so it never re-arms again.

@@ -21,6 +21,7 @@ module is pure enough to test without an OpenCode host.
 | `verifier.ts`   | Completion gate: citations (exact, then unique basename), then declared or observed test proof                  |
 | `proof.ts`      | Executes a recorded proof command under timeout, output cap and cwd pin                                         |
 | `limits.ts`     | Turn, wall-time, delay and per-session cooldown budgets                                                         |
+| `gc.ts`         | Stale per-session file collection plus shared fresh-pending helper for startup rearm                            |
 
 ## Invariants
 
@@ -61,6 +62,10 @@ module is pure enough to test without an OpenCode host.
     long session is not born over budget. A one-shot stop (budget wrap or idle
     park) writes from the claim snapshot, never from the state loaded before the
     claim, so a `goal_set` that lands in that window is not overwritten.
+13. Stale lanes never wake the loop: `gc.ts` archives per-session files older than
+    `STALE_GOAL_MAX_AGE_MS` before rearm, the startup scan clears a stale
+    `pendingAttempt` through the shared `isFreshPendingAttempt` helper instead of
+    re-arming it, and every lane exit clears its lease so TTL is only a backstop.
 
 ## Risks
 

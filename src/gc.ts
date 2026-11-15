@@ -256,3 +256,28 @@ export async function collectStaleGoalFiles(
   }
   return result;
 }
+
+/**
+ * Decide whether a persisted pending attempt is fresh enough to re-arm.
+ * Why a shared helper: the startup rearm in `index.ts` and the GC pass in
+ * this module must agree on one staleness policy, so the threshold lives in
+ * `limits.ts` and the comparison lives here where tests pin it.
+ * @param lastAttemptMs epoch ms of the last attempt recorded in state
+ * @param nowMs injected current time in epoch ms
+ * @param maxAgeMs staleness window, defaults to STALE_GOAL_MAX_AGE_MS
+ */
+export function isFreshPendingAttempt(
+  lastAttemptMs: number,
+  nowMs: number,
+  maxAgeMs: number = STALE_GOAL_MAX_AGE_MS,
+): boolean {
+  if (
+    !Number.isFinite(lastAttemptMs) ||
+    !Number.isFinite(nowMs) ||
+    !Number.isFinite(maxAgeMs)
+  )
+    return false;
+  if (maxAgeMs < 0) return false;
+  const age = nowMs - lastAttemptMs;
+  return age >= 0 && age <= maxAgeMs;
+}

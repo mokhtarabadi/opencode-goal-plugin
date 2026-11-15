@@ -27,8 +27,11 @@ All notable changes follow Keep a Changelog.
 - Crash recovery: session.error plus execution.failed listeners, classifyFailure, 90s watchdog, session-start rearm, retryable send, persisted pendingAttempt.
 - Agent-callable goal tools (goal_set, goal_block, goal_complete, goal_resume) calling pure helpers directly with lease guard and slash-identical messages.
 - Fifth agent tool goal_evidence (sole evidence writer) plus /goal evidence slash mirror: set to evidence to complete is now reachable with the verifier gate unchanged.
+- Stale goal garbage collection: `gc.ts` archives per-session goal files older than 24h out of the scan by rename with a recovery log, never touching the current session, fresh files, unreadable files, or leased active lanes; 11 new tests.
 
 ### Fixed
+
+- Startup rearm no longer resumes abandoned lanes: a pending attempt older than the stale threshold is cleared through the shared `isFreshPendingAttempt` helper instead of arming the watchdog, while a recent attempt re-arms exactly as before.
 
 - Host-native V2 export: default is Plugin.define with id plus setup wiring slash goal plus idle plus compaction.
 - ESM-only dist because the plugin package ships no require entry.

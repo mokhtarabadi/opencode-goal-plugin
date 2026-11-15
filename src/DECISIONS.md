@@ -25,6 +25,7 @@ reader inside `src/` finds the reasoning without leaving the folder.
 | ADR-016 idle human-gate park + movable citations   | `loop.ts`, `goal.ts`, `state.ts`, `index.ts`, `verifier.ts`  |
 | ADR-017 a new objective restarts the budget clocks | `goal.ts`, `limits.ts`                                       |
 | ADR-018 stop/retry writes follow the claimed state | `loop.ts`, `index.ts`, `watchdog.ts`                         |
+| ADR-019 stale goal GC plus guarded rearm           | `gc.ts`, `index.ts`, `limits.ts`                             |
 
 ## Local notes
 

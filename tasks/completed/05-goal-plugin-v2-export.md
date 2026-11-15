@@ -1,7 +1,8 @@
 # Task 05: Goal Plugin V2 Export Shape
 
-**File:** `tasks/in-progress/05-goal-plugin-v2-export.md`
-**Status:** in-progress
+**File:** `tasks/completed/05-goal-plugin-v2-export.md`
+**Status:** closed
+**Finished:** 2026-11-15T08:27:36Z
 **Source:** manager
 **Type:** bug
 **Project:** /home/mohammad/Develop/Projects/opencode-goal-plugin
