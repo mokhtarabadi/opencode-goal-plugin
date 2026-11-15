@@ -4,7 +4,12 @@ All notable changes follow Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-15
+
 ### Added
+
+- Compaction snapshot plus restore with restoreCount audit and cooldown clamp.
+- Evidence sidecar schema plus local verifier plus optional subagent dispatch.
 
 - The idle loop now parks on a human gate instead of spending turns on it: `loop.ts` counts consecutive continuation turns that made no tool call and left the goal state unchanged (`scoreContinuationTurn`, `IDLE_PARK_THRESHOLD = 2`), stops auto-continuing, and posts exactly one message naming `goal_block <reason>` and `goal_resume`. The `question` tool parks the next tick immediately, any tool call or foreign state write resets the streak, and the goal stays `active` — a latch (`idleParked`) replaces any new status, so `goal_block` is callable at once and `goal_resume` gains the active-and-parked case. The wiring reads `session.tool.input.started` / `session.tool.called` and withholds the observation until the lane has proven it reports tool activity, so a host that stays silent cannot park a productive goal. 13 new tests.
 
@@ -54,15 +59,6 @@ All notable changes follow Keep a Changelog.
 - A provider error now rearms the watchdog from the failing session's scoped state file instead of the legacy path, so the recovery ADR-007 added actually arms for per-session lanes (and can no longer arm another session's legacy goal inside the failing lane).
 - Docs: `GoalState` now says plainly that `iterationCount`/`tokenSpend` are loop-only counters (zeros are normal when no continuation ran) and that `wallTimeMs` is reserved telemetry no lane advances, so a zero must never be read as "no time spent"; `recordTurnResult` is marked deprecated and unwired.
 - Version: package plus `PLUGIN_VERSION` 0.2.1 for this behaviour fix; the 0.3.0 publish gate noted above is unaffected.
-
-## [0.3.0] - 2026-10-16
-
-### Added
-
-- Compaction snapshot plus restore with restoreCount audit and cooldown clamp.
-- Evidence sidecar schema plus local verifier plus optional subagent dispatch.
-
-### Fixed
 
 - Verification-pending pauses auto turns without stopping the goal.
 - Compaction registration never throws: whole body inside try plus null host guard.

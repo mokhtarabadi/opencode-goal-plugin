@@ -53,4 +53,7 @@ Host API drift is the risk, contained by defensive casts plus fail-closed probes
 - Pending.
 
 <!-- BEGIN_GIT_DIFF -->
+```diff
+No code changes detected or staged.
+```
 <!-- END_GIT_DIFF -->

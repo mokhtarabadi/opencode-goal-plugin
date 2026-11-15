@@ -72,7 +72,7 @@ import { STALE_GOAL_MAX_AGE_MS } from './limits.js';
  */
 
 export const PLUGIN_NAME = 'opencode-goal-plugin';
-export const PLUGIN_VERSION = '0.2.1';
+export const PLUGIN_VERSION = '0.3.0';
 
 /**
  * Message when the state lease is already held by another lane.
